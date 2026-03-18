@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en" style="background:#050A12">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IOCoin Splash Sync Preview</title>
+  <link rel="stylesheet" href="../src/renderer/styles.css">
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+    .preview-note {
+      position: fixed;
+      right: 20px;
+      bottom: 16px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: rgba(3, 9, 20, 0.82);
+      border: 1px solid rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.65);
+      font: 12px/1.4 -apple-system,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      letter-spacing: 0.02em;
+    }
+    .preview-shell {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+    }
+    .preview-shell .splash-bar {
+      width: 68%;
+      animation: none;
+    }
+    .preview-shell .splash-network {
+      display: flex;
+    }
+  </style>
+</head>
+<body class="compact-mode splash-active splash-syncing">
+  <div class="preview-shell">
+    <div id="splashOverlay" class="splash-overlay">
+      <div class="splash-content">
+        <img src="../assets/icon.png" alt="IOCoin" class="splash-logo">
+        <div id="splashStatus" class="splash-status">Syncing with the network</div>
+        <div id="splashMeta" class="splash-meta">Current block: 5,540,998 - Blocks left: 2,414 (~20 minutes remaining)</div>
+        <div class="splash-network" aria-hidden="true">
+          <div class="splash-network-side left">
+            <span class="splash-network-lane"><span class="splash-peer"></span><span class="splash-packet"></span></span>
+            <span class="splash-network-lane"><span class="splash-peer"></span><span class="splash-packet"></span></span>
+            <span class="splash-network-lane"><span class="splash-peer"></span><span class="splash-packet"></span></span>
+          </div>
+          <div class="splash-network-core">
+            <span class="splash-core-layer"></span>
+            <span class="splash-core-layer"></span>
+            <span class="splash-core-layer"></span>
+          </div>
+          <div class="splash-network-side right">
+            <span class="splash-network-lane"><span class="splash-peer"></span><span class="splash-packet"></span></span>
+            <span class="splash-network-lane"><span class="splash-peer"></span><span class="splash-packet"></span></span>
+            <span class="splash-network-lane"><span class="splash-peer"></span><span class="splash-packet"></span></span>
+          </div>
+        </div>
+        <div class="splash-progress">
+          <div class="splash-bar"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="preview-note">Open this file in a browser to preview the sync screen animation.</div>
+</body>
+</html>

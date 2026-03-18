@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IOC UI Layout Editor</title>
+  <style>
+    :root{
+      --bg:#0a0f1b;
+      --panel:#111a2c;
+      --panel2:#162640;
+      --line:#223858;
+      --text:#e9f1ff;
+      --muted:#98aac7;
+      --accent:#33a2da;
+      --good:#67d0ff;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:linear-gradient(135deg,#16003a 0%,#0d1630 60%,#35091c 100%);color:var(--text);font-family:Segoe UI,Roboto,Arial,sans-serif}
+    .app{display:grid;grid-template-rows:auto 1fr;height:100%}
+    .topbar{
+      display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+      padding:10px 12px;border-bottom:1px solid #273c5a;background:rgba(8,12,20,.78);backdrop-filter:blur(8px)
+    }
+    .topbar .title{font-weight:700;margin-right:10px}
+    .btn,.field,select,input{
+      border:1px solid #2d466b;background:#13213a;color:var(--text);border-radius:8px;
+      height:34px;padding:0 10px;font-size:13px
+    }
+    .btn{cursor:pointer}
+    .btn:hover{border-color:#3f6395}
+    .btn.primary{background:#1f6c96;border-color:#2f92c8}
+    .btn.good{background:#165e46;border-color:#2d8e70}
+    .btn.warn{background:#5d4520;border-color:#8b6830}
+    .spacer{flex:1}
+    .main{display:grid;grid-template-columns:1fr 340px;gap:10px;padding:10px;min-height:0}
+    .left{
+      background:rgba(10,16,28,.65);border:1px solid #263b57;border-radius:12px;min-width:0;
+      display:grid;grid-template-rows:auto 1fr;overflow:hidden
+    }
+    .canvas-head{
+      display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid #20344f;background:rgba(17,27,42,.8)
+    }
+    .canvas-wrap{
+      overflow:auto;
+      padding:12px;
+      display:flex;
+      justify-content:center;
+      align-items:flex-start;
+    }
+    #canvas{
+      position:relative;margin:0 auto;background:#050a12;border:1px solid #2a4260;border-radius:14px;box-shadow:0 20px 45px rgba(0,0,0,.45);
+      transform-origin:top center;
+    }
+    .grid{
+      position:absolute;inset:0;pointer-events:none;opacity:.22;
+      background-image:
+        linear-gradient(to right, rgba(115,152,196,.2) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(115,152,196,.2) 1px, transparent 1px);
+      background-size:20px 20px;
+      display:none;
+    }
+    #canvas.show-grid .grid{display:block}
+
+    .node{
+      position:absolute;display:flex;align-items:center;justify-content:center;
+      color:#fff;background:rgba(20,35,60,.55);border:1px solid rgba(140,180,235,.2);
+      border-radius:10px;cursor:move;user-select:none;padding:0 8px;white-space:normal;overflow:hidden;text-overflow:ellipsis;line-height:1.12;text-align:center;
+    }
+    .node.button,.node.icon{white-space:nowrap}
+    .node.text{
+      background:transparent;
+      border-color:transparent;
+      overflow:visible;
+      text-overflow:clip;
+      white-space:nowrap;
+    }
+    .node.line{border-radius:0}
+    .node.selected{outline:2px dashed var(--good);outline-offset:1px}
+    .resize{
+      position:absolute;right:-7px;bottom:-7px;width:14px;height:14px;border-radius:50%;
+      border:1px solid #9be3ff;background:#225f86;cursor:nwse-resize
+    }
+    .right{
+      background:rgba(10,16,28,.75);border:1px solid #263b57;border-radius:12px;overflow:auto;padding:10px
+    }
+    .sect{border:1px solid #223751;border-radius:10px;padding:10px;margin-bottom:10px;background:rgba(18,30,48,.45)}
+    .sect h3{margin:0 0 8px;font-size:13px;letter-spacing:.02em;color:#c7d6ef}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+    .label{font-size:11px;color:var(--muted);margin-bottom:4px}
+    .row{display:flex;gap:8px;align-items:center}
+    .row + .row{margin-top:8px}
+    .full{width:100%}
+    .hint{font-size:11px;color:#93a9ca;line-height:1.4}
+    .list{max-height:180px;overflow:auto;border:1px solid #27405f;border-radius:8px}
+    .item{
+      display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid #20344f;cursor:pointer;font-size:12px
+    }
+    .item:last-child{border-bottom:0}
+    .item.active{background:rgba(51,162,218,.22)}
+    .tag{font-size:10px;color:#8eb7df;border:1px solid #315c8a;border-radius:6px;padding:2px 6px}
+    .muted{color:#9ab0ce}
+    .kbd{font-family:Consolas,monospace;background:#1a2a44;border:1px solid #2c4a73;border-radius:5px;padding:1px 5px;font-size:11px}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div class="title">IOC Wallet UI Layout Editor</div>
+      <label class="label" style="margin:0">View</label>
+      <select id="viewSelect" class="field"></select>
+      <label class="label" style="margin:0">Canvas W</label>
+      <input id="canvasW" class="field" type="number" min="360" step="10" style="width:90px">
+      <label class="label" style="margin:0">H</label>
+      <input id="canvasH" class="field" type="number" min="280" step="10" style="width:90px">
+      <button id="applyCanvas" class="btn">Apply Size</button>
+      <button id="toggleGrid" class="btn">Grid</button>
+      <button id="saveLocal" class="btn good">Save Local</button>
+      <button id="exportJson" class="btn primary">Export JSON</button>
+      <button id="importJson" class="btn warn">Import JSON</button>
+      <button id="resetAll" class="btn">Reset</button>
+      <div class="spacer"></div>
+      <span class="hint">Drag to move, drag corner to resize, <span class="kbd">Del</span> to remove selected.</span>
+      <input id="importFile" type="file" accept=".json" hidden>
+    </div>
+
+    <div class="main">
+      <div class="left">
+        <div class="canvas-head">
+          <strong id="viewName">overview</strong>
+          <span class="muted">Live editable mock, no real wallet logic.</span>
+        </div>
+        <div class="canvas-wrap">
+          <div id="canvas">
+            <div class="grid"></div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="right">
+        <div class="sect">
+          <h3>Nodes</h3>
+          <div class="row">
+            <button id="addText" class="btn">+ Text</button>
+            <button id="addPanel" class="btn">+ Panel</button>
+            <button id="addButton" class="btn">+ Button</button>
+            <button id="addIcon" class="btn">+ Icon</button>
+          </div>
+          <div id="nodeList" class="list" style="margin-top:8px"></div>
+        </div>
+
+        <div class="sect">
+          <h3>Selected Node</h3>
+          <div class="row">
+            <div class="full">
+              <div class="label">ID</div>
+              <input id="fId" class="field full" readonly>
+            </div>
+            <div class="full">
+              <div class="label">Type</div>
+              <input id="fType" class="field full" readonly>
+            </div>
+          </div>
+          <div class="row">
+            <div class="full">
+              <div class="label">Text</div>
+              <input id="fText" class="field full">
+            </div>
+          </div>
+          <div class="grid2 row" style="margin-top:8px">
+            <div><div class="label">X</div><input id="fX" class="field full" type="number"></div>
+            <div><div class="label">Y</div><input id="fY" class="field full" type="number"></div>
+            <div><div class="label">W</div><input id="fW" class="field full" type="number"></div>
+            <div><div class="label">H</div><input id="fH" class="field full" type="number"></div>
+          </div>
+          <div class="grid3 row" style="margin-top:8px">
+            <div><div class="label">Font</div><input id="fFont" class="field full" type="number"></div>
+            <div><div class="label">Weight</div><input id="fWeight" class="field full" type="number"></div>
+            <div><div class="label">Radius</div><input id="fRadius" class="field full" type="number"></div>
+          </div>
+          <div class="grid3 row" style="margin-top:8px">
+            <div><div class="label">Text Color</div><input id="fColor" class="field full" type="color"></div>
+            <div><div class="label">BG Color</div><input id="fBg" class="field full" type="color"></div>
+            <div><div class="label">Border</div><input id="fBorder" class="field full" type="color"></div>
+          </div>
+          <div class="row">
+            <div class="full">
+              <div class="label">Opacity (0-1)</div>
+              <input id="fOpacity" class="field full" type="number" min="0" max="1" step="0.05">
+            </div>
+            <div class="full">
+              <div class="label">Align</div>
+              <select id="fAlign" class="field full">
+                <option value="left">left</option>
+                <option value="center">center</option>
+                <option value="right">right</option>
+              </select>
+            </div>
+          </div>
+          <div class="row">
+            <button id="bringFront" class="btn">Bring Front</button>
+            <button id="sendBack" class="btn">Send Back</button>
+            <button id="duplicateNode" class="btn">Duplicate</button>
+            <button id="deleteNode" class="btn warn">Delete</button>
+          </div>
+        </div>
+
+        <div class="sect">
+          <h3>How to use</h3>
+          <div class="hint">
+            1) Pick a view and move/resize elements.<br>
+            2) Use the inspector for precise dimensions.<br>
+            3) Click <strong>Export JSON</strong> and send me that file.<br>
+            4) I will map those exact values into the real wallet CSS/JS.
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = "ioc-ui-layout-editor-v3";
+    const SNAP = 2;
+
+    const rawLayouts = {
+      splash: {
+        canvas: { w: 760, h: 560 },
+        nodes: [
+          n("topbar","panel","",0,0,760,78,{bg:"#202020",border:"#2e2e2e",radius:0}),
+          n("menu","text","File   Edit   View   Window   Help",20,52,300,18,{font:16,color:"#f3f7ff",weight:500,align:"left"}),
+          n("logoRing","panel","",286,112,188,188,{bg:"#0b1526",border:"#3fbff9",radius:999,opacity:.45}),
+          n("logo","text","IO",346,177,68,56,{font:36,weight:800,color:"#50bff7"}),
+          n("syncTitle","text","Syncing with the network",140,336,480,44,{font:24,weight:700,color:"#eef4ff"}),
+          n("syncMeta","text","Current block: 5,555,500 - Blocks left: 90",132,390,500,26,{font:18,weight:500,color:"#9facc0"}),
+          n("etaBar","panel","Calculating ETA...",90,438,580,30,{bg:"#19486a",border:"#2a597f",radius:20,font:16,weight:700,color:"#f0f5ff"}),
+          n("debugBtn","button","Show live debug",250,486,260,40,{bg:"#112442",border:"#33557b",radius:24,font:14,weight:600,color:"#eef4ff"})
+        ]
+      },
+      overview: {
+        canvas: { w: 1360, h: 840 },
+        nodes: [
+          ...commonHeader("Overview"),
+          n("mainCard","panel","",16,252,1328,568,{bg:"#1f4970",border:"#5aa7d6",radius:24,opacity:.46}),
+          n("innerCard","panel","",56,322,1248,458,{bg:"#173553",border:"#4f96c8",radius:18,opacity:.62}),
+            n("label","text","TOTAL I/O AVAILABLE",484,366,392,42,{font:20,weight:700,color:"#dae8ff"}),
+            n("balance","text","10",608,448,144,124,{font:88,weight:800,color:"#ffffff"}),
+            n("staking","text","STAKING: 0",560,596,240,44,{font:16,weight:500,color:"#b6c3d8"}),
+            n("send","button","Send",584,664,192,64,{bg:"#3aa1d8",border:"#5fb8e6",radius:16,font:20,weight:700,color:"#fff"})
+        ]
+      },
+      history: {
+        canvas: { w: 1360, h: 840 },
+        nodes: [
+          ...commonHeader("History"),
+          n("card","panel","",16,252,1328,568,{bg:"#1f4970",border:"#5aa7d6",radius:24,opacity:.46}),
+          n("inner","panel","",56,322,1248,458,{bg:"#173553",border:"#4f96c8",radius:18,opacity:.62}),
+            n("title","text","History",628,360,120,40,{font:28,weight:700,color:"#eaf2ff"}),
+          n("table","panel","",98,426,1164,286,{bg:"#0f2743",border:"#365f86",radius:12,opacity:.75}),
+            n("h1","text","When",116,450,140,30,{font:18,weight:600,color:"#e8f2ff",align:"left"}),
+            n("h2","text","Amount",400,450,160,30,{font:18,weight:600,color:"#e8f2ff",align:"left"}),
+            n("h3","text","Address / Txid",590,450,380,30,{font:18,weight:600,color:"#e8f2ff",align:"left"})
+        ]
+      },
+      addresses: {
+        canvas: { w: 1360, h: 840 },
+        nodes: [
+          ...commonHeader("My Addresses"),
+          n("card","panel","",16,252,1328,568,{bg:"#1f4970",border:"#5aa7d6",radius:24,opacity:.46}),
+          n("inner","panel","",56,322,1248,458,{bg:"#173553",border:"#4f96c8",radius:18,opacity:.62}),
+            n("title","text","My Addresses",88,356,260,38,{font:24,weight:700,color:"#eaf2ff",align:"left"}),
+            n("new","button","+ New Address",1050,348,214,52,{bg:"#3aa1d8",border:"#5fb8e6",radius:14,font:18,weight:700,color:"#fff"}),
+            n("row1","panel","Main   iStkzT3NqNL2r3YEnMZU...",86,430,1174,70,{bg:"#0f2743",border:"#365f86",radius:12,font:16,weight:500,color:"#e7f0ff",align:"left"})
+        ]
+      },
+      recipients: {
+        canvas: { w: 1360, h: 840 },
+        nodes: [
+          ...commonHeader("Saved recipients"),
+          n("card","panel","",16,252,1328,568,{bg:"#1f4970",border:"#5aa7d6",radius:24,opacity:.46}),
+          n("inner","panel","",56,322,1248,458,{bg:"#173553",border:"#4f96c8",radius:18,opacity:.62}),
+            n("create","button","Create new recipient",500,370,360,64,{bg:"#3aa1d8",border:"#5fb8e6",radius:14,font:22,weight:700,color:"#fff"}),
+            n("ttl","text","Saved recipients",556,454,246,44,{font:28,weight:700,color:"#eaf2ff"}),
+            n("note","text","Local address book for this device only.",500,518,360,28,{font:16,weight:500,color:"#a9bdd9"}),
+            n("privacy","button","Disable Privacy Mode",550,560,258,48,{bg:"#3aa1d8",border:"#5fb8e6",radius:14,font:16,weight:600,color:"#fff"}),
+            n("rec1","panel","adr  et44gd4...",96,644,1160,70,{bg:"#0f2743",border:"#365f86",radius:12,font:16,weight:500,color:"#dce9fd",align:"left"}),
+            n("eye1","icon","eye",948,665,48,28,{font:16,weight:700,color:"#9fb3cf"}),
+            n("btns1","text","Copy   Edit   Delete",1030,665,220,30,{font:16,weight:600,color:"#dce9fd",align:"left"})
+        ]
+      },
+      settings: {
+        canvas: { w: 1360, h: 840 },
+        nodes: [
+          ...commonHeader("Settings"),
+          n("tools","panel","",20,254,1320,152,{bg:"#1f4970",border:"#5aa7d6",radius:24,opacity:.46}),
+          n("toolsInner","panel","",56,286,1248,90,{bg:"#173553",border:"#4f96c8",radius:16,opacity:.62}),
+            n("toolsT","text","Wallet Tools",250,316,220,36,{font:26,weight:700,color:"#eaf2ff"}),
+            n("dump","button","DUMP",478,314,118,48,{bg:"#3aa1d8",border:"#5fb8e6",radius:12,font:18,weight:700,color:"#fff"}),
+            n("import","button","IMPORT",604,314,132,48,{bg:"#3aa1d8",border:"#5fb8e6",radius:12,font:18,weight:700,color:"#fff"}),
+            n("path","button","OPEN DEFAULT PATH",744,314,254,48,{bg:"#3aa1d8",border:"#5fb8e6",radius:12,font:18,weight:700,color:"#fff"}),
+            n("backup","button","BACKUP",1006,314,144,48,{bg:"#3aa1d8",border:"#5fb8e6",radius:12,font:18,weight:700,color:"#fff"})
+        ]
+      }
+    };
+
+    const defaultLayouts = {
+      splash: scaleLayout(rawLayouts.splash, 480, 360),
+      overview: scaleLayout(rawLayouts.overview, 960, 720),
+      history: scaleLayout(rawLayouts.history, 960, 720),
+      addresses: scaleLayout(rawLayouts.addresses, 960, 720),
+      recipients: scaleLayout(rawLayouts.recipients, 960, 720),
+      settings: scaleLayout(rawLayouts.settings, 960, 720)
+    };
+
+    function commonHeader(active){
+      const tabs = ["Overview","History","My Addresses","Saved recipients","Settings"];
+      const out = [
+        n("windowTop","panel","",0,0,1360,88,{bg:"#202020",border:"#2e2e2e",radius:0}),
+        n("windowMenu","text","File   Edit   View   Window   Help",20,54,300,20,{font:16,color:"#f3f7ff",weight:500,align:"left"}),
+        n("appTitle","text","I/O Coin Widget Wallet",390,110,580,64,{font:30,weight:800,color:"#f2f6ff"}),
+        n("icons","text","lock  bars  stake  menu",1090,120,240,40,{font:16,weight:600,color:"#8bc5e8"})
+      ];
+      let x = 120;
+      tabs.forEach((t, idx) => {
+        const isActive = t === active;
+        out.push(n("tab"+idx,"button",t,x,186,170,54,{
+          bg:isActive ? "#3aa1d8" : "#0f1f3b",
+          border:isActive ? "#5fb8e6" : "#28456a",
+          radius:27,
+          font:20,
+          weight:700,
+          color:isActive ? "#05111f" : "#f0f6ff"
+        }));
+        x += 186;
+      });
+      out.push(n("line","line","",0,262,1360,3,{bg:"#2f9fd8",border:"#2f9fd8",radius:0}));
+      return out;
+    }
+
+    function n(id,type,text,x,y,w,h,s={}){
+      return {
+        id,type,text,x,y,w,h,
+        font:s.font ?? 18,
+        weight:s.weight ?? 600,
+        color:s.color ?? "#ffffff",
+        bg:s.bg ?? "rgba(20,35,60,.55)",
+        border:s.border ?? "rgba(140,180,235,.2)",
+        radius:s.radius ?? 10,
+        align:s.align ?? "center",
+        opacity:s.opacity ?? 1,
+        z:s.z ?? 1
+      };
+    }
+
+    const state = {
+      layouts: clone(defaultLayouts),
+      view: "overview",
+      selectedId: null,
+      drag: null,
+      showGrid: false,
+      scale: 1
+    };
+
+    const ui = {
+      viewSelect: byId("viewSelect"),
+      viewName: byId("viewName"),
+      canvas: byId("canvas"),
+      canvasWrap: document.querySelector(".canvas-wrap"),
+      canvasW: byId("canvasW"),
+      canvasH: byId("canvasH"),
+      nodeList: byId("nodeList"),
+      importFile: byId("importFile"),
+      fields: {
+        id: byId("fId"), type: byId("fType"), text: byId("fText"),
+        x: byId("fX"), y: byId("fY"), w: byId("fW"), h: byId("fH"),
+        font: byId("fFont"), weight: byId("fWeight"), radius: byId("fRadius"),
+        color: byId("fColor"), bg: byId("fBg"), border: byId("fBorder"),
+        opacity: byId("fOpacity"), align: byId("fAlign")
+      }
+    };
+
+    init();
+
+    function init(){
+      Object.keys(state.layouts).forEach(v=>{
+        const o = document.createElement("option");
+        o.value = v; o.textContent = v;
+        ui.viewSelect.appendChild(o);
+      });
+      ui.viewSelect.value = state.view;
+      wireTopbar();
+      wireInspector();
+      restoreLocal();
+      render();
+      window.addEventListener("resize", fitCanvasScale);
+      window.addEventListener("keydown", onKey);
+    }
+
+    function wireTopbar(){
+      ui.viewSelect.addEventListener("change", ()=>{ state.view = ui.viewSelect.value; state.selectedId = null; render(); });
+      byId("applyCanvas").addEventListener("click", ()=>{
+        const v = currentView();
+        v.canvas.w = clamp(num(ui.canvasW.value, v.canvas.w), 360, 3000);
+        v.canvas.h = clamp(num(ui.canvasH.value, v.canvas.h), 260, 2200);
+        renderCanvasSize();
+      });
+      byId("toggleGrid").addEventListener("click", ()=>{
+        state.showGrid = !state.showGrid;
+        ui.canvas.classList.toggle("show-grid", state.showGrid);
+      });
+      byId("saveLocal").addEventListener("click", saveLocal);
+      byId("exportJson").addEventListener("click", exportJson);
+      byId("importJson").addEventListener("click", ()=> ui.importFile.click());
+      ui.importFile.addEventListener("change", importJsonFile);
+      byId("resetAll").addEventListener("click", ()=>{
+        if(!confirm("Reset all views to defaults?")) return;
+        state.layouts = clone(defaultLayouts);
+        state.selectedId = null;
+        render();
+      });
+
+      byId("addText").addEventListener("click", ()=>addNode("text"));
+      byId("addPanel").addEventListener("click", ()=>addNode("panel"));
+      byId("addButton").addEventListener("click", ()=>addNode("button"));
+      byId("addIcon").addEventListener("click", ()=>addNode("icon"));
+      byId("deleteNode").addEventListener("click", deleteSelected);
+      byId("duplicateNode").addEventListener("click", duplicateSelected);
+      byId("bringFront").addEventListener("click", ()=>zShift(1));
+      byId("sendBack").addEventListener("click", ()=>zShift(-1));
+    }
+
+    function wireInspector(){
+      const F = ui.fields;
+      bind(F.text, v=>upd("text", v));
+      bind(F.x, v=>upd("x", num(v,0)));
+      bind(F.y, v=>upd("y", num(v,0)));
+      bind(F.w, v=>upd("w", Math.max(20, num(v,20))));
+      bind(F.h, v=>upd("h", Math.max(16, num(v,16))));
+      bind(F.font, v=>upd("font", Math.max(8, num(v,12))));
+      bind(F.weight, v=>upd("weight", clamp(num(v,600),100,900)));
+      bind(F.radius, v=>upd("radius", Math.max(0, num(v,0))));
+      bind(F.color, v=>upd("color", v));
+      bind(F.bg, v=>upd("bg", v));
+      bind(F.border, v=>upd("border", v));
+      bind(F.opacity, v=>upd("opacity", clamp(parseFloat(v || "1"),0,1)));
+      bind(F.align, v=>upd("align", v));
+    }
+
+    function bind(el, fn){
+      ["input","change"].forEach(evt => el.addEventListener(evt, ()=>{ fn(el.value); render(false); }));
+    }
+
+    function render(full=true){
+      renderCanvasSize();
+      renderNodes();
+      renderNodeList();
+      renderInspector();
+      ui.viewName.textContent = state.view;
+      if(full) saveLocal();
+    }
+
+    function renderCanvasSize(){
+      const v = currentView();
+      ui.canvas.style.width = v.canvas.w + "px";
+      ui.canvas.style.height = v.canvas.h + "px";
+      ui.canvasW.value = v.canvas.w;
+      ui.canvasH.value = v.canvas.h;
+      ui.canvas.classList.toggle("show-grid", state.showGrid);
+      fitCanvasScale();
+    }
+
+    function renderNodes(){
+      [...ui.canvas.querySelectorAll(".node")].forEach(n => n.remove());
+      const v = currentView();
+      const ordered = [...v.nodes].sort((a,b)=>a.z-b.z);
+      ordered.forEach(node=>{
+        const el = document.createElement("div");
+        el.className = "node " + node.type + (node.id===state.selectedId ? " selected" : "");
+        el.dataset.id = node.id;
+        styleNode(el,node);
+        el.textContent = node.text || "";
+        el.addEventListener("pointerdown", e => startDrag(e, node.id, false));
+        el.addEventListener("dblclick", () => {
+          select(node.id);
+          const t = prompt("Text", node.text || "");
+          if(t !== null){ node.text = t; render(); }
+        });
+        if(node.id===state.selectedId){
+          const rz = document.createElement("div");
+          rz.className = "resize";
+          rz.addEventListener("pointerdown", e => startDrag(e, node.id, true));
+          el.appendChild(rz);
+        }
+        ui.canvas.appendChild(el);
+      });
+    }
+
+    function styleNode(el, n){
+      el.style.left = n.x + "px";
+      el.style.top = n.y + "px";
+      el.style.width = n.w + "px";
+      el.style.height = n.h + "px";
+      el.style.zIndex = n.z;
+      el.style.fontSize = n.font + "px";
+      el.style.fontWeight = n.weight;
+      el.style.color = n.color;
+      el.style.background = n.bg;
+      el.style.borderColor = n.border;
+      el.style.borderRadius = n.radius + "px";
+      el.style.opacity = n.opacity;
+      el.style.justifyContent = n.align === "left" ? "flex-start" : n.align === "right" ? "flex-end" : "center";
+      if(n.type==="text"){
+        el.style.borderColor = "transparent";
+        el.style.background = "transparent";
+      }
+      if(n.type==="line"){
+        el.style.padding = "0";
+      }
+    }
+
+    function renderNodeList(){
+      ui.nodeList.innerHTML = "";
+      currentView().nodes
+        .slice()
+        .sort((a,b)=>a.z-b.z)
+        .forEach(n=>{
+          const it = document.createElement("div");
+          it.className = "item" + (n.id===state.selectedId ? " active" : "");
+          it.innerHTML = `<span class="tag">${n.type}</span><span>${escapeHtml(n.id)}</span><span class="muted">${escapeHtml((n.text||"").slice(0,24))}</span>`;
+          it.addEventListener("click", ()=>{ select(n.id); render(false); });
+          ui.nodeList.appendChild(it);
+        });
+    }
+
+    function renderInspector(){
+      const F = ui.fields;
+      const n = selected();
+      const disabled = !n;
+      Object.values(F).forEach(x=>x.disabled = disabled);
+      if(!n){
+        F.id.value = ""; F.type.value = ""; F.text.value = "";
+        return;
+      }
+      F.id.value = n.id; F.type.value = n.type; F.text.value = n.text || "";
+      F.x.value = round(n.x); F.y.value = round(n.y); F.w.value = round(n.w); F.h.value = round(n.h);
+      F.font.value = round(n.font); F.weight.value = round(n.weight); F.radius.value = round(n.radius);
+      F.color.value = toColor(n.color, "#ffffff");
+      F.bg.value = toColor(n.bg, "#1e3557");
+      F.border.value = toColor(n.border, "#4b79ad");
+      F.opacity.value = n.opacity;
+      F.align.value = n.align || "center";
+    }
+
+    function startDrag(e, id, resize){
+      e.preventDefault();
+      e.stopPropagation();
+      select(id);
+      const node = selected();
+      const rect = ui.canvas.getBoundingClientRect();
+      const p = pointerToCanvas(e, rect);
+      state.drag = {
+        id, resize,
+        startX:p.x, startY:p.y,
+        ox:node.x, oy:node.y, ow:node.w, oh:node.h
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", endDrag, { once:true });
+    }
+
+    function onMove(e){
+      if(!state.drag) return;
+      const d = state.drag;
+      const node = selected();
+      const rect = ui.canvas.getBoundingClientRect();
+      const p = pointerToCanvas(e, rect);
+      const dx = snap(p.x - d.startX);
+      const dy = snap(p.y - d.startY);
+      if(d.resize){
+        node.w = clamp(snap(d.ow + dx), 20, currentView().canvas.w - node.x);
+        node.h = clamp(snap(d.oh + dy), 16, currentView().canvas.h - node.y);
+      }else{
+        node.x = clamp(snap(d.ox + dx), 0, currentView().canvas.w - node.w);
+        node.y = clamp(snap(d.oy + dy), 0, currentView().canvas.h - node.h);
+      }
+      render(false);
+    }
+
+    function endDrag(){
+      window.removeEventListener("pointermove", onMove);
+      state.drag = null;
+      saveLocal();
+    }
+
+    function onKey(e){
+      if(e.key === "Delete"){ deleteSelected(); }
+      if((e.ctrlKey || e.metaKey) && e.key.toLowerCase()==="s"){
+        e.preventDefault(); saveLocal();
+      }
+    }
+
+    function select(id){ state.selectedId = id; }
+    function selected(){ return currentView().nodes.find(x=>x.id===state.selectedId) || null; }
+    function currentView(){ return state.layouts[state.view]; }
+
+    function upd(k,v){
+      const n = selected(); if(!n) return;
+      n[k] = v;
+    }
+
+    function addNode(type){
+      const id = type + "_" + Math.random().toString(36).slice(2,7);
+      const node = n(id, type, type.toUpperCase(), 80, 80, type==="text"?220:200, type==="text"?40:56, {
+        font:type==="icon"?28:18,
+        bg:type==="text" ? "transparent" : "#1a3558",
+        border:"#4a79ad",
+        color:"#eaf2ff",
+        radius:type==="line"?0:10
+      });
+      node.z = nextZ();
+      currentView().nodes.push(node);
+      state.selectedId = id;
+      render();
+    }
+
+    function deleteSelected(){
+      if(!state.selectedId) return;
+      const arr = currentView().nodes;
+      const idx = arr.findIndex(x=>x.id===state.selectedId);
+      if(idx<0) return;
+      arr.splice(idx,1);
+      state.selectedId = null;
+      render();
+    }
+
+    function duplicateSelected(){
+      const n0 = selected(); if(!n0) return;
+      const copy = clone(n0);
+      copy.id = n0.id + "_copy";
+      copy.x += 14; copy.y += 14; copy.z = nextZ();
+      currentView().nodes.push(copy);
+      state.selectedId = copy.id;
+      render();
+    }
+
+    function zShift(dir){
+      const n0 = selected(); if(!n0) return;
+      n0.z = Math.max(1, n0.z + dir);
+      normalizeZ();
+      render();
+    }
+
+    function normalizeZ(){
+      const nodes = currentView().nodes.slice().sort((a,b)=>a.z-b.z);
+      nodes.forEach((x,i)=>x.z = i+1);
+    }
+    function nextZ(){
+      return currentView().nodes.reduce((m,x)=>Math.max(m,x.z||1),1)+1;
+    }
+
+    function saveLocal(){
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.layouts));
+    }
+
+    function restoreLocal(){
+      try{
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if(!raw) return;
+        const parsed = JSON.parse(raw);
+        if(parsed && typeof parsed==="object") state.layouts = parsed;
+      }catch{}
+    }
+
+    function exportJson(){
+      const data = JSON.stringify(state.layouts, null, 2);
+      const blob = new Blob([data], {type:"application/json"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "ioc-ui-layout.json";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    function importJsonFile(e){
+      const file = e.target.files?.[0];
+      if(!file) return;
+      const r = new FileReader();
+      r.onload = () => {
+        try{
+          const parsed = JSON.parse(String(r.result || ""));
+          if(!parsed || typeof parsed!=="object") throw new Error("Invalid JSON");
+          state.layouts = parsed;
+          state.selectedId = null;
+          render();
+        }catch(err){
+          alert("Invalid layout JSON");
+        }finally{
+          ui.importFile.value = "";
+        }
+      };
+      r.readAsText(file);
+    }
+
+    function pointerToCanvas(e, rect){
+      return {
+        x: (e.clientX - rect.left) / state.scale,
+        y: (e.clientY - rect.top) / state.scale
+      };
+    }
+
+    function scaleLayout(layout, targetW, targetH){
+      const srcW = Number(layout?.canvas?.w || targetW || 1);
+      const srcH = Number(layout?.canvas?.h || targetH || 1);
+      const sx = targetW / srcW;
+      const sy = targetH / srcH;
+      const sf = Math.min(sx, sy);
+      const out = clone(layout);
+      out.canvas = { w: targetW, h: targetH };
+      out.nodes = (out.nodes || []).map((node) => ({
+        ...node,
+        x: Math.round((node.x || 0) * sx),
+        y: Math.round((node.y || 0) * sy),
+        w: Math.max(12, Math.round((node.w || 0) * sx)),
+        h: Math.max(10, Math.round((node.h || 0) * sy)),
+        font: Math.max(9, Math.round((node.font || 14) * sf)),
+        radius: Math.max(0, Math.round((node.radius || 0) * sf))
+      }));
+      return out;
+    }
+
+    function fitCanvasScale(){
+      if(!ui.canvasWrap) return;
+      const v = currentView();
+      const maxW = Math.max(280, ui.canvasWrap.clientWidth - 28);
+      const maxH = Math.max(220, ui.canvasWrap.clientHeight - 28);
+      const scale = Math.min(1, maxW / v.canvas.w, maxH / v.canvas.h);
+      state.scale = Number.isFinite(scale) ? scale : 1;
+      ui.canvas.style.transform = `scale(${state.scale})`;
+    }
+
+    function byId(id){ return document.getElementById(id); }
+    function clone(v){ return JSON.parse(JSON.stringify(v)); }
+    function num(v,d){ const n = Number(v); return Number.isFinite(n) ? n : d; }
+    function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+    function snap(v){ return Math.round(v / SNAP) * SNAP; }
+    function round(v){ return Math.round(v); }
+    function toColor(v, fallback){
+      if(typeof v !== "string") return fallback;
+      if(/^#[0-9a-fA-F]{6}$/.test(v)) return v;
+      return fallback;
+    }
+    function escapeHtml(s){
+      return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    }
+  </script>
+</body>
+</html>

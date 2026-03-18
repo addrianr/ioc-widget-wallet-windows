@@ -7,13 +7,13 @@ function extractRpcError(e) {
   // Electron IPC wraps: "Error invoking remote method 'ioc:rpc': Error: <actual message>"
   const ipcMatch = /Error invoking remote method '[^']+': (?:Error: )?(.+)/.exec(msg);
   if (ipcMatch) return ipcMatch[1];
-  // Axios wraps: "Request failed with status code 500" — but daemon msg may be in response
+  // Axios wraps: "Request failed with status code 500" â€” but daemon msg may be in response
   if (/status code 500/i.test(msg)) return 'Insufficient funds';
   return msg;
 }
 
 let state = { unlocked: false, encrypted: null, peers: 0, synced: false, blocks: 0 };
-let lockOverrideUntil = 0; // timestamp — suppress polling lock overwrite until this time
+let lockOverrideUntil = 0; // timestamp â€” suppress polling lock overwrite until this time
 let refreshing = false;
 let nextTimer = null;
 let last = { bal: null, stakeAmt: null, stakeOn: null, vp: 0, blocks: 0, headers: 0 };
@@ -28,36 +28,707 @@ let splashState = {
   blockchainIndexShown: false,
   syncStartTime: null,  // When sync phase started (for ETA calculation)
   syncStartBlocks: null, // Blocks when sync phase started
-  phase: 'connecting'   // 'connecting' | 'downloading' | 'installing' | 'syncing'
+  etaReadySince: 0,
+  lastBlocksPerSec: 0,
+  longPhaseKey: null,   // 'daemon' | 'index' | 'waiting'
+  longPhaseStartedAt: 0,
+  longPhaseAttemptCurrent: 0,
+  longPhaseAttemptTotal: 0,
+  phase: 'connecting',   // 'connecting' | 'downloading' | 'installing' | 'syncing'
+  stepFlow: 'startup',   // 'startup' | 'bootstrap'
+  debugExpanded: false,
+  logAutoFollow: true
 };
 
 // Constants for splash behavior
-const SPLASH_BLOCKS_THRESHOLD = 25; // Hide splash when within this many blocks of tip
+const SPLASH_BLOCKS_THRESHOLD = 0; // Hide splash only once the node reaches the network tip
+const SEND_FEE_IOC = 0.001;
+const SEND_ALL_EPSILON = 0.00000001;
+const LOG_FOLLOW_THRESHOLD_PX = 20;
+const SPLASH_STATUS_REFERENCE_TEXTS = [
+  'Loading daemon... this may take a few minutes',
+  'Extracting blockchain data (this may take a few minutes)...',
+  'Installing blockchain files...',
+  'Downloading bootstrap... 100%',
+  'Syncing with the network'
+];
+const REBOOTSTRAP_REMOTE_LEAD_BLOCKS = 500;
+const REBOOTSTRAP_NOTICE_AFTER_ETA_MS = 10 * 1000;
+const REBOOTSTRAP_OVERHEAD_SECONDS = 15 * 60;
+const REBOOTSTRAP_NOTICE_TTL_MS = 15 * 60 * 1000;
+const REBOOTSTRAP_SNOOZE_MS = 60 * 60 * 1000;
+const SPLASH_LOG_POLL_INTERVAL_MS = 1200;
+const SPLASH_SYNC_REFRESH_INTERVAL_MS = 1200;
+const SEND_DISABLED_SYNC_MESSAGE = 'Sending is disabled until synchronization reaches 100%.';
+let _splashStatusFitRaf = null;
+let _splashUniformStatusFont = { available: 0, size: null };
+let _syncLockNoticeTimer = null;
+
+let rebootstrapAdvisorState = {
+  enabled: true,
+  startedAt: 0,
+  startBlock: 0,
+  remoteCheckInFlight: false,
+  remoteChecked: false,
+  remoteMeta: null,
+  remoteRetryAt: 0,
+  remoteFailures: 0,
+  applying: false,
+  noticeVisible: false,
+  noticeExpiresAt: 0,
+  dismissedUntil: 0,
+  candidate: null
+};
+
+let resumeRecoveryState = {
+  active: false,
+  seq: 0,
+  lastAt: 0,
+  watchdogTimer: null
+};
+const RESUME_RECOVERY_DEDUP_MS = 5000;
+const RESUME_RECOVERY_STAGE_MS = 1100;
+const RESUME_RECOVERY_STUCK_MS = 30000;
+
+function isLogNearBottom(el, threshold = LOG_FOLLOW_THRESHOLD_PX) {
+  if (!el) return true;
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
+}
+
+function scrollLogToBottom(el) {
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateSplashJumpLatestVisibility() {
+  const btn = $('splashDebugJump');
+  const logEl = $('splashLog');
+  if (!btn || !logEl) return;
+  const show = splashState.debugExpanded && !isLogNearBottom(logEl) && (logEl.scrollHeight > logEl.clientHeight);
+  btn.classList.toggle('hidden', !show);
+}
+
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function clearResumeRecoveryWatchdog() {
+  if (resumeRecoveryState.watchdogTimer) {
+    clearTimeout(resumeRecoveryState.watchdogTimer);
+    resumeRecoveryState.watchdogTimer = null;
+  }
+}
+
+function startResumeRecoveryWatchdog(seq) {
+  clearResumeRecoveryWatchdog();
+  resumeRecoveryState.watchdogTimer = setTimeout(async () => {
+    if (resumeRecoveryState.seq !== seq) return;
+    if (!splashState.visible) return;
+    const statusNow = ($('splashStatus')?.textContent || '').toLowerCase();
+    if (!statusNow.includes('resuming sync')) return;
+
+    console.warn('[resume] Resuming sync watchdog fired; forcing daemon restart');
+    updateSplashStatus('Resuming sync is taking too long...');
+    setSplashEta('Restarting daemon after system resume...');
+
+    try {
+      await window.ioc.restartDaemon();
+    } catch (err) {
+      console.warn('[resume] restartDaemon failed after watchdog:', err?.message || err);
+    }
+
+    if (resumeRecoveryState.seq !== seq) return;
+    setSplashStepFlow('startup');
+    setSplashPhase('connecting');
+    updateSplashStatus('Loading daemon... this may take a few minutes');
+    setSplashEta('Recovering after system resume...');
+    connectionState.connected = false;
+    connectionState.attempts = 0;
+    refresh();
+    setTimeout(() => {
+      if (resumeRecoveryState.seq === seq) refresh();
+    }, 2000);
+    resumeRecoveryState.active = false;
+    clearResumeRecoveryWatchdog();
+  }, RESUME_RECOVERY_STUCK_MS);
+}
+
+async function runResumeRecoveryFlow() {
+  if (bootstrapState.inProgress || rebootstrapAdvisorState.applying) return;
+
+  const now = Date.now();
+  if ((now - resumeRecoveryState.lastAt) < RESUME_RECOVERY_DEDUP_MS) return;
+  resumeRecoveryState.lastAt = now;
+  clearResumeRecoveryWatchdog();
+
+  const seq = ++resumeRecoveryState.seq;
+  resumeRecoveryState.active = true;
+
+  console.log('[resume] Starting post-sleep recovery flow');
+
+  setSplashStepFlow('startup');
+  showSplash();
+  setSplashPhase('connecting');
+  hideRebootstrapNotice({ disable: false });
+  setSplashMeta('');
+  updateSplashStatus('Reconnecting daemon...');
+  setSplashEta('Re-validating node after system resume...');
+
+  // Force reconnect path and immediate status pull.
+  connectionState.connected = false;
+  connectionState.attempts = 0;
+  refresh();
+
+  await sleepMs(RESUME_RECOVERY_STAGE_MS);
+  if (resumeRecoveryState.seq !== seq) return;
+  if (!splashState.visible) {
+    resumeRecoveryState.active = false;
+    return;
+  }
+
+  updateSplashStatus('Refreshing peers...');
+  setSplashEta('Refreshing network connections...');
+  refresh();
+
+  await sleepMs(RESUME_RECOVERY_STAGE_MS);
+  if (resumeRecoveryState.seq !== seq) return;
+  if (!splashState.visible) {
+    resumeRecoveryState.active = false;
+    return;
+  }
+
+  updateSplashStatus('Resuming sync...');
+  setSplashEta('Resuming blockchain sync...');
+  refresh();
+  startResumeRecoveryWatchdog(seq);
+
+  setTimeout(() => {
+    if (resumeRecoveryState.seq === seq) {
+      resumeRecoveryState.active = false;
+    }
+  }, 4000);
+}
+
+function fitSplashStatusSingleLine() {
+  const status = $('splashStatus');
+  const content = document.querySelector('.splash-content');
+  if (!status || !content) return;
+  const available = Math.max(200, content.clientWidth - 28);
+  const maxFont = 56;
+  const minFont = 14;
+
+  // During sync phase we intentionally prioritize the headline hierarchy:
+  // "Syncing with the network" must be the dominant text.
+  if (document.body.classList.contains('splash-syncing')) {
+    const computed = window.getComputedStyle(status);
+    const family = computed.fontFamily || '-apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif';
+    const isCompact = document.body.classList.contains('compact-mode');
+    const syncMax = isCompact ? 22 : 30;
+    const syncMin = isCompact ? 13 : 17;
+    const text = (status.textContent || '').trim() || 'Syncing with the network';
+    const measureCtx = (fitSplashStatusSingleLine._syncMeasureCtx ||= document.createElement('canvas').getContext('2d'));
+    let size = syncMax;
+    while (size > syncMin) {
+      measureCtx.font = `700 ${size}px ${family}`;
+      const measured = measureCtx.measureText(text).width;
+      if (measured <= available) break;
+      size -= 1;
+    }
+    status.style.whiteSpace = 'nowrap';
+    status.style.maxWidth = '100%';
+    status.style.overflow = 'hidden';
+    status.style.textOverflow = 'ellipsis';
+    status.style.fontWeight = '700';
+    status.style.letterSpacing = '-0.005em';
+    status.style.fontSize = `${size}px`;
+    return;
+  }
+
+  // Compute one shared font size based on the longest startup text.
+  // This keeps all splash messages visually uniform across phases.
+  let uniformSize = _splashUniformStatusFont.size;
+  if (!_splashUniformStatusFont.size || _splashUniformStatusFont.available !== available) {
+    const measureCtx = (fitSplashStatusSingleLine._measureCtx ||= document.createElement('canvas').getContext('2d'));
+    const computed = window.getComputedStyle(status);
+    const weight = computed.fontWeight || '500';
+    const family = computed.fontFamily || '-apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif';
+    const spacingToken = computed.letterSpacing || '0px';
+    let size = maxFont;
+    while (size > minFont) {
+      measureCtx.font = `${weight} ${size}px ${family}`;
+      const spacingPx = (() => {
+        if (spacingToken.endsWith('px')) return parseFloat(spacingToken) || 0;
+        if (spacingToken.endsWith('em')) return (parseFloat(spacingToken) || 0) * size;
+        return 0;
+      })();
+      const measured = SPLASH_STATUS_REFERENCE_TEXTS.reduce((longest, txt) => {
+        const w = measureCtx.measureText(txt).width + Math.max(0, txt.length - 1) * spacingPx;
+        return Math.max(longest, w);
+      }, 0);
+      if (measured <= available) break;
+      size -= 1;
+    }
+    uniformSize = size;
+    _splashUniformStatusFont = { available, size: uniformSize };
+  }
+
+  status.style.whiteSpace = 'nowrap';
+  status.style.maxWidth = '100%';
+  status.style.overflow = 'hidden';
+  status.style.textOverflow = 'ellipsis';
+  status.style.fontWeight = '';
+  status.style.letterSpacing = '';
+  status.style.fontSize = `${uniformSize}px`;
+}
+
+function normalizeSplashStatusText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return '';
+  const compact = raw.replace(/\s+/g, ' ');
+
+  // Never show long technical file-lock paths in splash headline.
+  if (
+    /(?:\bEBUSY\b|\bEPERM\b|resource busy|cannot obtain a lock|unlink)/i.test(compact) ||
+    /[A-Za-z]:\\|\/Users\/|\/home\/|AppData\\|txleveldb/i.test(compact)
+  ) {
+    return 'Could not apply bootstrap files. Returning to local sync...';
+  }
+
+  return compact;
+}
+
+function scheduleSplashStatusFit() {
+  if (_splashStatusFitRaf) cancelAnimationFrame(_splashStatusFitRaf);
+  _splashStatusFitRaf = requestAnimationFrame(() => {
+    _splashStatusFitRaf = null;
+    fitSplashStatusSingleLine();
+    requestAnimationFrame(fitSplashStatusSingleLine);
+  });
+}
+
+function inferLongPhaseFromStatus(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return null;
+  if (/loading blockchain index/.test(t)) return 'index';
+  if (/waiting for daemon to start|starting daemon/.test(t)) return 'waiting';
+  if (/loading daemon/.test(t)) return 'daemon';
+  return null;
+}
+
+function parseAttemptFromStatus(text) {
+  const m = /attempt\s*(\d+)\s*\/\s*(\d+)/i.exec(String(text || ''));
+  if (!m) return null;
+  const current = Number(m[1]);
+  const total = Number(m[2]);
+  if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 0) return null;
+  return { current, total };
+}
+
+function resetSplashLongPhaseProgress() {
+  splashState.longPhaseKey = null;
+  splashState.longPhaseStartedAt = 0;
+  splashState.longPhaseAttemptCurrent = 0;
+  splashState.longPhaseAttemptTotal = 0;
+}
+
+function updateSplashLongPhaseFromStatus(statusText) {
+  if (!splashState.visible || splashState.phase !== 'connecting') {
+    resetSplashLongPhaseProgress();
+    updateSplashStepIndicator();
+    return;
+  }
+
+  const nextKey = inferLongPhaseFromStatus(statusText);
+  if (!nextKey) {
+    resetSplashLongPhaseProgress();
+    updateSplashStepIndicator();
+    return;
+  }
+
+  if (splashState.longPhaseKey !== nextKey) {
+    splashState.longPhaseKey = nextKey;
+    splashState.longPhaseStartedAt = Date.now();
+    splashState.longPhaseAttemptCurrent = 0;
+    splashState.longPhaseAttemptTotal = 0;
+  }
+
+  const attempt = parseAttemptFromStatus(statusText);
+  if (attempt) {
+    splashState.longPhaseAttemptCurrent = attempt.current;
+    splashState.longPhaseAttemptTotal = attempt.total;
+  }
+
+  updateSplashStepIndicator();
+}
+
+function ensureSplashDecorations() {
+  const content = document.querySelector('.splash-content');
+  const progress = document.querySelector('.splash-progress');
+  const log = $('splashLog');
+  const status = $('splashStatus');
+  if (!content || !progress || !status || !log) return;
+
+  if (!$('splashMeta')) {
+    const meta = document.createElement('div');
+    meta.id = 'splashMeta';
+    meta.className = 'splash-meta hidden';
+    status.insertAdjacentElement('afterend', meta);
+  }
+
+  if (!$('splashStage')) {
+    const stage = document.createElement('div');
+    stage.id = 'splashStage';
+    stage.className = 'splash-stage';
+    stage.setAttribute('aria-hidden', 'true');
+    stage.innerHTML = `
+      <div class="splash-stage-chain">
+        <span class="splash-stage-block"></span>
+        <span class="splash-stage-block"></span>
+        <span class="splash-stage-block"></span>
+        <span class="splash-stage-block"></span>
+        <span class="splash-stage-block"></span>
+      </div>`;
+    $('splashMeta')?.insertAdjacentElement('afterend', stage);
+  }
+
+  if (!$('splashEta')) {
+    const eta = document.createElement('div');
+    eta.id = 'splashEta';
+    eta.className = 'splash-eta';
+    eta.textContent = 'Estimating ETA...';
+    progress.appendChild(eta);
+  }
+
+  if (!$('splashStepIndicator')) {
+    const step = document.createElement('div');
+    step.id = 'splashStepIndicator';
+    step.className = 'splash-step-indicator';
+    step.textContent = '1/3';
+    progress.insertAdjacentElement('afterend', step);
+  }
+
+  // Section 2 wrapper: Current block + animation + ETA bar
+  if (!$('splashSyncSection2')) {
+    const section2 = document.createElement('div');
+    section2.id = 'splashSyncSection2';
+    section2.className = 'splash-sync-section2';
+    status.insertAdjacentElement('afterend', section2);
+  }
+  const section2 = $('splashSyncSection2');
+  const meta = $('splashMeta');
+  const stage = $('splashStage');
+  const stepIndicator = $('splashStepIndicator');
+  if (section2 && meta && meta.parentNode !== section2) section2.appendChild(meta);
+  if (section2 && stage && stage.parentNode !== section2) section2.appendChild(stage);
+  if (section2 && progress && progress.parentNode !== section2) section2.appendChild(progress);
+  if (section2 && stepIndicator && stepIndicator.parentNode !== section2) section2.appendChild(stepIndicator);
+
+  // Keep deterministic order once without re-appending every refresh
+  // (re-appending can restart CSS animations on some platforms).
+  if (section2) {
+    const ordered = [meta, stage, progress, stepIndicator].filter(Boolean);
+    for (let i = 0; i < ordered.length; i += 1) {
+      const node = ordered[i];
+      const atPos = section2.children[i] === node;
+      if (!atPos) {
+        section2.insertBefore(node, section2.children[i] || null);
+      }
+    }
+  }
+
+  if (!$('splashDebugToggle')) {
+    const wrap = document.createElement('div');
+    wrap.className = 'splash-debug-cta-wrap';
+    wrap.innerHTML = `<button id="splashDebugToggle" class="splash-debug-toggle" type="button">Show live debug</button>`;
+    if (section2) {
+      section2.insertAdjacentElement('afterend', wrap);
+    } else {
+      progress.insertAdjacentElement('afterend', wrap);
+    }
+  }
+
+  const ctaWrap = document.querySelector('.splash-debug-cta-wrap');
+  if (section2 && ctaWrap && ctaWrap.parentNode === section2) {
+    section2.insertAdjacentElement('afterend', ctaWrap);
+  }
+
+  if (!$('splashDebugWrap')) {
+    const wrap = document.createElement('div');
+    wrap.id = 'splashDebugWrap';
+    wrap.className = 'splash-debug-wrap';
+      wrap.innerHTML = `
+        <div class="splash-debug-inner">
+          <div class="splash-debug-panel">
+            <div class="splash-debug-head">
+              <div class="splash-debug-title">Live Debug Output</div>
+              <div class="splash-debug-head-right">
+                <div id="splashDebugConnections" class="splash-debug-connections">Connections: 0</div>
+                <button id="splashDebugJump" class="splash-debug-jump hidden" type="button">Jump to latest</button>
+                <div class="splash-debug-pill">LIVE</div>
+              </div>
+            </div>
+          </div>
+        </div>`;
+    const panel = wrap.querySelector('.splash-debug-panel');
+    panel.appendChild(log);
+    const currentCtaWrap = document.querySelector('.splash-debug-cta-wrap');
+    currentCtaWrap?.insertAdjacentElement('afterend', wrap);
+  }
+
+  const toggle = $('splashDebugToggle');
+  if (toggle && !toggle.dataset.bound) {
+    toggle.dataset.bound = '1';
+    toggle.addEventListener('click', () => {
+      setSplashDebugExpanded(!splashState.debugExpanded);
+    });
+  }
+
+  const jump = $('splashDebugJump');
+  if (jump && !jump.dataset.bound) {
+    jump.dataset.bound = '1';
+    jump.addEventListener('click', () => {
+      splashState.logAutoFollow = true;
+      scrollLogToBottom($('splashLog'));
+      updateSplashJumpLatestVisibility();
+    });
+  }
+
+  if (!log.dataset.boundScroll) {
+    log.dataset.boundScroll = '1';
+    log.addEventListener('scroll', () => {
+      splashState.logAutoFollow = isLogNearBottom(log);
+      updateSplashJumpLatestVisibility();
+    });
+  }
+
+  updateSplashStepIndicator();
+}
+
+function getSplashStepInfo() {
+  const flow = splashState.stepFlow || 'startup';
+  const phase = splashState.phase || 'connecting';
+
+  if (flow === 'bootstrap') {
+    const map = {
+      downloading: 1,
+      installing: 2,
+      connecting: 3,
+      syncing: 4
+    };
+    return { current: map[phase] || 1, total: 4 };
+  }
+
+  if (phase === 'connecting') {
+    const longMap = { daemon: 1, index: 2, waiting: 3 };
+    return { current: longMap[splashState.longPhaseKey] || 1, total: 3 };
+  }
+  if (phase === 'syncing') return { current: 3, total: 3 };
+  return { current: 1, total: 3 };
+}
+
+function updateSplashStepIndicator() {
+  const el = $('splashStepIndicator');
+  if (!el) return;
+  const { current, total } = getSplashStepInfo();
+  el.textContent = `${current}/${total}`;
+}
+
+function setSplashStepFlow(flow) {
+  splashState.stepFlow = flow === 'bootstrap' ? 'bootstrap' : 'startup';
+  updateSplashStepIndicator();
+}
+
+function setSplashMeta(text) {
+  ensureSplashDecorations();
+  const meta = $('splashMeta');
+  if (!meta) return;
+  if (text) {
+    meta.textContent = text;
+    meta.classList.remove('hidden');
+  } else {
+    meta.textContent = '';
+    meta.classList.add('hidden');
+  }
+}
+
+function setSplashEta(text) {
+  ensureSplashDecorations();
+  const eta = $('splashEta');
+  if (!eta) return;
+  const value = text || '';
+  eta.textContent = value;
+  const etaReady = !!value && !/calculating eta/i.test(value);
+  if (etaReady) {
+    if (!splashState.etaReadySince) splashState.etaReadySince = Date.now();
+  } else {
+    splashState.etaReadySince = 0;
+  }
+}
+
+let _splashDebugToggleBusy = false;
+let _splashLastDebugToggleAt = 0;
+let _splashLogStartTimer = null;
+
+function clearSplashLogStartTimer() {
+  if (_splashLogStartTimer) {
+    clearTimeout(_splashLogStartTimer);
+    _splashLogStartTimer = null;
+  }
+}
+
+function scheduleSplashLogStart(delayMs = 1000) {
+  clearSplashLogStartTimer();
+  _splashLogStartTimer = setTimeout(() => {
+    _splashLogStartTimer = null;
+    if (!splashState.visible || !splashState.debugExpanded) return;
+    startSplashLog();
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function setSplashDebugExpanded(expanded) {
+  const now = Date.now();
+  if (now - _splashLastDebugToggleAt < 180) return;
+  if (_splashDebugToggleBusy) return;
+  _splashLastDebugToggleAt = now;
+  _splashDebugToggleBusy = true;
+  const wantExpanded = !!expanded;
+  if (wantExpanded === splashState.debugExpanded) {
+    _splashDebugToggleBusy = false;
+    return;
+  }
+  splashState.debugExpanded = wantExpanded;
+  const toggle = $('splashDebugToggle');
+  if (toggle) {
+    toggle.disabled = true;
+    toggle.textContent = wantExpanded ? 'Hide live debug' : 'Show live debug';
+  }
+  if (!wantExpanded) {
+    $('splashDebugJump')?.classList.add('hidden');
+  }
+
+  const applyOpenClass = () => {
+    document.body.classList.add('splash-debug-open');
+    updateSplashJumpLatestVisibility();
+  };
+  const applyCloseClass = () => {
+    document.body.classList.remove('splash-debug-open');
+  };
+  const finishToggle = () => {
+    _splashDebugToggleBusy = false;
+    if (toggle) toggle.disabled = false;
+  };
+  const openAfterResize = () => {
+    requestAnimationFrame(() => {
+      applyOpenClass();
+      scheduleSplashLogStart(1000);
+      finishToggle();
+    });
+  };
+  const closeAfterResize = () => {
+    requestAnimationFrame(() => {
+      applyCloseClass();
+      finishToggle();
+    });
+  };
+
+  if (window.ioc && typeof window.ioc.setSplashDebugExpanded === 'function') {
+    if (wantExpanded) {
+      Promise.resolve(window.ioc.setSplashDebugExpanded(true))
+        .catch(() => {})
+        .finally(() => {
+          openAfterResize();
+        });
+    } else {
+      clearSplashLogStartTimer();
+      stopSplashLog();
+      Promise.resolve(window.ioc.setSplashDebugExpanded(false))
+        .catch(() => {})
+        .finally(() => {
+          closeAfterResize();
+        });
+    }
+  } else {
+    if (wantExpanded) {
+      openAfterResize();
+    } else {
+      clearSplashLogStartTimer();
+      stopSplashLog();
+      closeAfterResize();
+    }
+  }
+}
+
+function setSplashPhase(phase) {
+  splashState.phase = phase;
+  const syncing = phase === 'syncing';
+  document.body.classList.toggle('splash-syncing', syncing);
+  if (phase !== 'connecting') clearResumeRecoveryWatchdog();
+  if (phase !== 'connecting') resetSplashLongPhaseProgress();
+  if (!syncing) {
+    splashState.etaReadySince = 0;
+    splashState.lastBlocksPerSec = 0;
+    clearSplashLogStartTimer();
+    stopSplashLog();
+    hideRebootstrapNotice({ disable: false });
+    setSplashMeta('');
+    setSplashEta('');
+    if (splashState.debugExpanded) setSplashDebugExpanded(false);
+  }
+
+  const splashBar = document.querySelector('.splash-bar');
+  if (splashBar && !syncing) {
+    splashBar.style.width = '30%';
+    splashBar.style.animation = 'splash-indeterminate 0.84s ease-in-out infinite';
+  }
+  updateSplashStepIndicator();
+  scheduleSplashStatusFit();
+}
 
 function showSplash(text) {
   const overlay = $('splashOverlay');
   const status = $('splashStatus');
+  ensureSplashDecorations();
   if (overlay) overlay.classList.remove('hidden');
   if (status && text) status.textContent = text;
   document.body.classList.add('splash-active');
+  setSplashPhase(splashState.phase);
   splashState.visible = true;
-  // Start live log tail when splash is visible
-  if (typeof startSplashLog === 'function') startSplashLog();
+  clearSplashLogStartTimer();
+  if (typeof stopSplashLog === 'function') stopSplashLog();
+  scheduleSplashStatusFit();
 }
 
 function hideSplash() {
   const overlay = $('splashOverlay');
   if (overlay) overlay.classList.add('hidden');
   document.body.classList.remove('splash-active');
+  document.body.classList.remove('splash-syncing');
   splashState.visible = false;
+  splashState.stepFlow = 'startup';
+  if (splashState.debugExpanded) {
+    setSplashDebugExpanded(false);
+  } else {
+    document.body.classList.remove('splash-debug-open');
+  }
+  splashState.debugExpanded = false;
+  splashState.logAutoFollow = true;
+  clearResumeRecoveryWatchdog();
+  resetSplashLongPhaseProgress();
+  setSplashMeta('');
+  setSplashEta('');
+  hideRebootstrapNotice({ disable: true });
   if (typeof _stopLogHeightPoller === 'function') _stopLogHeightPoller();
+  clearSplashLogStartTimer();
   // Stop live log tail when splash hides
   if (typeof stopSplashLog === 'function') stopSplashLog();
 }
 
 function updateSplashStatus(text) {
   const status = $('splashStatus');
-  if (status && text) status.textContent = text;
+  const normalized = normalizeSplashStatusText(text);
+  if (status && normalized) status.textContent = normalized;
+  updateSplashLongPhaseFromStatus(normalized);
+  scheduleSplashStatusFit();
 }
 
 // Check if splash should show progressive loading messages
@@ -82,8 +753,8 @@ function checkSplashLongWait() {
 function updateSplashSyncStatus(blocks, targetHeight) {
   if (!splashState.visible || splashState.phase !== 'syncing') return;
 
-  const blocksRemaining = targetHeight - blocks;
-  let statusText = `Syncing blocks… ${blocks.toLocaleString()}`;
+  const blocksRemaining = Math.max(0, targetHeight - blocks);
+  let statusText = `Syncing blocksâ€¦ ${blocks.toLocaleString()}`;
 
   // Calculate ETA if we have sync start data
   if (splashState.syncStartTime && splashState.syncStartBlocks !== null) {
@@ -96,12 +767,19 @@ function updateSplashSyncStatus(blocks, targetHeight) {
       if (blocksPerSec > 0) {
         const secondsRemaining = blocksRemaining / blocksPerSec;
         const etaText = formatETA(secondsRemaining);
-        statusText = `Syncing blocks… ${blocks.toLocaleString()} (~${etaText} remaining)`;
+        statusText = `Syncing blocksâ€¦ ${blocks.toLocaleString()} (~${etaText} remaining)`;
       }
     }
   }
 
   updateSplashStatus(statusText);
+  if (targetHeight > 0) {
+    setSplashMeta(
+      `Current block ${blocks.toLocaleString()} / Network tip ${targetHeight.toLocaleString()} â€¢ ${blocksRemaining.toLocaleString()} remaining`
+    );
+  } else {
+    setSplashMeta(`Current block ${blocks.toLocaleString()}`);
+  }
 
   // Update progress bar if deterministic progress is possible
   const splashBar = document.querySelector('.splash-bar');
@@ -109,6 +787,44 @@ function updateSplashSyncStatus(blocks, targetHeight) {
     const pct = Math.min(100, Math.round((blocks / targetHeight) * 100));
     splashBar.style.width = pct + '%';
     splashBar.style.animation = 'none'; // Stop indeterminate animation
+  }
+}
+
+// Override the initial splash sync formatter with copy and layout tuned for the
+// Windows sync screen. Keeping it here avoids touching the older mojibake block.
+function updateSplashSyncStatus(blocks, targetHeight) {
+  if (!splashState.visible || splashState.phase !== 'syncing') return;
+
+  const blocksRemaining = Math.max(0, targetHeight - blocks);
+  let etaText = 'Calculating ETA...';
+
+  if (splashState.syncStartTime && splashState.syncStartBlocks !== null) {
+    const elapsedMs = Date.now() - splashState.syncStartTime;
+    const blocksSynced = blocks - splashState.syncStartBlocks;
+
+    if (targetHeight > 0 && blocksSynced > 10 && elapsedMs > 5000) {
+      const blocksPerSec = blocksSynced / (elapsedMs / 1000);
+      if (blocksPerSec > 0) {
+        splashState.lastBlocksPerSec = blocksPerSec;
+        const secondsRemaining = blocksRemaining / blocksPerSec;
+        etaText = `${formatETA(secondsRemaining)} remaining`;
+      }
+    }
+  }
+
+  updateSplashStatus('Syncing with the network');
+  if (targetHeight > 0) {
+    setSplashMeta(`Current block: ${blocks.toLocaleString()} - Blocks left: ${blocksRemaining.toLocaleString()}`);
+  } else {
+    setSplashMeta(`Current block: ${blocks.toLocaleString()}`);
+  }
+  setSplashEta(etaText);
+
+  const splashBar = document.querySelector('.splash-bar');
+  if (splashBar && targetHeight > 0 && blocks > 0) {
+    const pct = Math.min(100, Math.round((blocks / targetHeight) * 100));
+    splashBar.style.width = pct + '%';
+    splashBar.style.animation = 'none';
   }
 }
 
@@ -125,18 +841,75 @@ function formatETA(seconds) {
   return mins > 0 ? `~${hours} hours ${mins} min` : `~${hours} hours`;
 }
 
+function resetRebootstrapAdvisorState(blocks) {
+  rebootstrapAdvisorState = {
+    enabled: true,
+    startedAt: Date.now(),
+    startBlock: Number.isFinite(blocks) ? blocks : 0,
+    remoteCheckInFlight: false,
+    remoteChecked: false,
+    remoteMeta: null,
+    remoteRetryAt: 0,
+    remoteFailures: 0,
+    applying: false,
+    noticeVisible: false,
+    noticeExpiresAt: 0,
+    dismissedUntil: 0,
+    candidate: null
+  };
+}
+
+function primeRebootstrapRemoteMetadata() {
+  if (!rebootstrapAdvisorState.enabled) return;
+  if (rebootstrapAdvisorState.remoteChecked || rebootstrapAdvisorState.remoteCheckInFlight) return;
+  if (Date.now() < (rebootstrapAdvisorState.remoteRetryAt || 0)) return;
+  if (!window.ioc?.getDailyBootstrapMetadata) {
+    rebootstrapAdvisorState.enabled = false;
+    return;
+  }
+
+  rebootstrapAdvisorState.remoteCheckInFlight = true;
+  let ok = false;
+  window.ioc.getDailyBootstrapMetadata()
+    .then((metadata) => {
+      rebootstrapAdvisorState.remoteMeta = metadata && metadata.ok ? metadata : null;
+      if (!rebootstrapAdvisorState.remoteMeta) {
+        rebootstrapAdvisorState.remoteRetryAt = Date.now() + 15000;
+        rebootstrapAdvisorState.remoteFailures = (rebootstrapAdvisorState.remoteFailures || 0) + 1;
+        console.warn('[rebootstrap] remote metadata unavailable, will retry:', metadata?.error || 'unknown');
+        return;
+      }
+      ok = true;
+      rebootstrapAdvisorState.remoteFailures = 0;
+      rebootstrapAdvisorState.remoteRetryAt = 0;
+    })
+    .catch((err) => {
+      rebootstrapAdvisorState.remoteRetryAt = Date.now() + 15000;
+      rebootstrapAdvisorState.remoteFailures = (rebootstrapAdvisorState.remoteFailures || 0) + 1;
+      console.warn('[rebootstrap] metadata check failed, will retry:', err?.message || err);
+    })
+    .finally(() => {
+      rebootstrapAdvisorState.remoteChecked = ok;
+      rebootstrapAdvisorState.remoteCheckInFlight = false;
+    });
+}
+
 /**
  * Start the syncing phase of splash screen.
  */
 function startSplashSyncPhase(blocks) {
-  splashState.phase = 'syncing';
+  setSplashPhase('syncing');
   splashState.syncStartTime = Date.now();
   splashState.syncStartBlocks = blocks;
+  splashState.etaReadySince = 0;
+  splashState.lastBlocksPerSec = 0;
+  resetRebootstrapAdvisorState(blocks);
+  primeRebootstrapRemoteMetadata();
   console.log('[splash] Started sync phase at block:', blocks);
   _startLogHeightPoller();
 }
 
-// Standalone splash poller — reads debug.log height every 500ms,
+// Standalone splash poller â€” reads debug.log height on a relaxed interval,
 // completely independent of refresh()/computeStatus().
 let _logPollTimer = null;
 function _startLogHeightPoller() {
@@ -151,45 +924,84 @@ function _startLogHeightPoller() {
       if (typeof lh === 'number' && lh > 0) {
         const tip = last.headers || 0;
         updateSplashSyncStatus(lh, tip);
+        maybeEvaluateDailyRebootstrap(lh).catch(() => {});
       }
     } catch {}
-  }, 500);
+  }, SPLASH_LOG_POLL_INTERVAL_MS);
 }
 function _stopLogHeightPoller() {
   if (_logPollTimer) { clearInterval(_logPollTimer); _logPollTimer = null; }
 }
 // ===== Live Log Viewer (splash/bootstrap) =====
-const MAX_LOG_LINES = 40;
+const MAX_LOG_LINES = 120;
 let _splashLogRunning = false;
+let _splashLogUnsub = null;
 
-function startSplashLog() {
+function appendStyledLogChunk(logEl, chunk, options = {}) {
+  if (!logEl) return;
+  const replace = !!options.replace;
+  const stickToBottom = !!options.stickToBottom;
+  const maxLines = Number.isFinite(options.maxLines) ? Math.max(1, options.maxLines) : MAX_LOG_LINES;
+  const maxLineLength = Number.isFinite(options.maxLineLength) ? Math.max(20, options.maxLineLength) : 160;
+  if (replace) logEl.innerHTML = '';
+  const lines = String(chunk).split('\n').filter(l => l.trim().length > 0);
+  for (const l of lines) {
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    const lower = l.toLowerCase();
+    if (lower.includes('error') || lower.includes('failed')) {
+      div.classList.add('log-err');
+    } else if (lower.includes('accepted') || lower.includes('setbestchain') || lower.includes('successfully')) {
+      div.classList.add('log-ok');
+    }
+    div.textContent = l.length > maxLineLength ? l.substring(0, maxLineLength) + '...' : l;
+    logEl.appendChild(div);
+  }
+  while (logEl.children.length > maxLines) {
+    logEl.removeChild(logEl.firstChild);
+  }
+  if (stickToBottom) {
+    scrollLogToBottom(logEl);
+  }
+}
+
+function appendSplashLogChunk(chunk, replace = false) {
+  const logEl = document.getElementById('splashLog');
+  if (!logEl) return;
+  appendStyledLogChunk(logEl, chunk, {
+    replace,
+    stickToBottom: replace || splashState.logAutoFollow,
+    maxLines: MAX_LOG_LINES,
+    maxLineLength: 160
+  });
+  updateSplashJumpLatestVisibility();
+}
+
+function loadRecentSplashLog() {
+  if (!window.diag || !window.diag.recentTail) return Promise.resolve();
+  return Promise.resolve(window.diag.recentTail(MAX_LOG_LINES)).then((chunk) => {
+    const text = String(chunk || '');
+    if (text.trim()) {
+      appendSplashLogChunk(text, true);
+    }
+  }).catch(() => {});
+}
+
+function startSplashLog(forceRestart = false) {
+  if (forceRestart && _splashLogRunning) {
+    stopSplashLog();
+  }
   if (_splashLogRunning) return;
   if (typeof window.diag === 'undefined') return;
   _splashLogRunning = true;
-  window.diag.onData((line) => {
-    const logEl = document.getElementById('splashLog');
-    if (!logEl) return;
-    // Split multi-line chunks
-    const lines = String(line).split('\n').filter(l => l.trim().length > 0);
-    for (const l of lines) {
-      const div = document.createElement('div');
-      div.className = 'log-line';
-      // Highlight errors and successes
-      const lower = l.toLowerCase();
-      if (lower.includes('error') || lower.includes('failed')) {
-        div.classList.add('log-err');
-      } else if (lower.includes('accepted') || lower.includes('setbestchain') || lower.includes('successfully')) {
-        div.classList.add('log-ok');
-      }
-      div.textContent = l.length > 120 ? l.substring(0, 120) + '...' : l;
-      logEl.appendChild(div);
-    }
-    // Trim old lines
-    while (logEl.children.length > MAX_LOG_LINES) {
-      logEl.removeChild(logEl.firstChild);
-    }
-    // Auto-scroll to bottom
-    logEl.scrollTop = logEl.scrollHeight;
+  splashState.logAutoFollow = true;
+  if (_splashLogUnsub) {
+    try { _splashLogUnsub(); } catch {}
+    _splashLogUnsub = null;
+  }
+  loadRecentSplashLog();
+  _splashLogUnsub = window.diag.onData((line) => {
+    appendSplashLogChunk(line);
   });
   window.diag.startTail();
 }
@@ -197,6 +1009,10 @@ function startSplashLog() {
 function stopSplashLog() {
   if (!_splashLogRunning) return;
   _splashLogRunning = false;
+  if (_splashLogUnsub) {
+    try { _splashLogUnsub(); } catch {}
+    _splashLogUnsub = null;
+  }
   if (typeof window.diag !== 'undefined') {
     window.diag.stopTail();
   }
@@ -209,7 +1025,7 @@ function stopSplashLog() {
 let connectionState = {
   connected: false,
   attempts: 0,
-  maxAttempts: 30,       // ~4min total — daemon needs time to load block index after bootstrap
+  maxAttempts: 30,       // ~4min total â€” daemon needs time to load block index after bootstrap
   startTime: null,
   lastError: null
 };
@@ -315,10 +1131,11 @@ async function runBootstrapFlow() {
 
     console.log('[bootstrap] No chain data found, starting bootstrap flow');
     bootstrapState.inProgress = true;
+    setSplashStepFlow('bootstrap');
 
     // STEP 1: Download bootstrap (daemon has NOT been started yet)
-    splashState.phase = 'downloading';
-    updateSplashStatus('Downloading bootstrap…');
+    setSplashPhase('downloading');
+    updateSplashStatus('Downloading bootstrapâ€¦');
     showBootstrapModal();
     updateBootstrapUI('Downloading bootstrap...', 0, null);
 
@@ -333,7 +1150,7 @@ async function runBootstrapFlow() {
       const downloaded = formatBytes(progress.downloaded || 0);
       const total = formatBytes(progress.total || 0);
       updateBootstrapUI(`Downloading bootstrap... (${downloaded} / ${total})`, pct, null);
-      updateSplashStatus(`Downloading bootstrap… ${pct}%`);
+      updateSplashStatus(`Downloading bootstrapâ€¦ ${pct}%`);
     });
 
     const downloadResult = await window.ioc.downloadBootstrap();
@@ -342,23 +1159,22 @@ async function runBootstrapFlow() {
     }
 
     // STEP 2: Extract, install bootstrap files, then start daemon (with 30s timeout)
-    splashState.phase = 'installing';
-    updateSplashStatus('Installing blockchain files…');
+    setSplashPhase('installing');
+    updateSplashStatus('Installing blockchain filesâ€¦');
     updateBootstrapUI('Installing blockchain files...', 100, null);
 
     const applyResult = await window.ioc.applyBootstrap();
     if (!applyResult.ok) {
-      // applyBootstrap only returns ok:false when the daemon process dies.
-      // It never returns ok:false for RPC timeout (it polls indefinitely while alive).
+      // Bootstrap now fails explicitly if the daemon never becomes RPC-ready.
       throw new Error(applyResult.error || 'Install failed');
     }
 
-    // Done — daemon started and responded
+    // Done â€” daemon started and responded
     bootstrapState.inProgress = false;
     bootstrapState.completed = true;
     updateBootstrapUI('Setup complete! Starting sync...', 100, null);
-    splashState.phase = 'connecting';
-    updateSplashStatus('Starting sync…');
+    setSplashPhase('connecting');
+    updateSplashStatus('Starting syncâ€¦');
 
     await new Promise(r => setTimeout(r, 1500));
     hideBootstrapModal();
@@ -368,7 +1184,8 @@ async function runBootstrapFlow() {
     console.error('[bootstrap] Error:', err);
     bootstrapState.error = err.message || String(err);
     bootstrapState.inProgress = false;
-    splashState.phase = 'connecting';
+    setSplashStepFlow('startup');
+    setSplashPhase('connecting');
     updateBootstrapUI('Setup failed', 0, bootstrapState.error);
     return false;
   }
@@ -399,6 +1216,239 @@ function setupBootstrapHandlers() {
 }
 // ===== End Bootstrap State =====
 
+async function runRebootstrapFlow() {
+  setSplashStepFlow('bootstrap');
+  setSplashPhase('downloading');
+  updateSplashStatus('Downloading newer daily bootstrap...');
+  setSplashMeta('Using a newer daily bootstrap checkpoint to speed up synchronization.');
+  setSplashEta('Preparing download...');
+
+  window.ioc.onBootstrapProgress((progress) => {
+    if (progress.step && progress.message) {
+      updateSplashStatus(progress.message);
+      return;
+    }
+    const pct = progress.percent || 0;
+    updateSplashStatus(`Downloading bootstrap... ${pct}%`);
+    setSplashEta(pct > 0 ? `${pct}% downloaded` : 'Preparing download...');
+  });
+
+  const downloadResult = await window.ioc.downloadBootstrap();
+  if (!downloadResult?.ok) {
+    throw new Error(downloadResult?.error || 'Download failed');
+  }
+
+  setSplashPhase('installing');
+  updateSplashStatus('Installing newer daily bootstrap...');
+  setSplashEta('Installing blockchain data...');
+  const applyResult = await window.ioc.applyBootstrap({ stopDaemonFirst: true, source: 'rebootstrap' });
+  if (!applyResult?.ok) {
+    throw new Error(applyResult?.error || 'Bootstrap apply failed');
+  }
+
+  setSplashPhase('connecting');
+  updateSplashStatus('Restarting daemon...');
+  setSplashMeta('');
+  setSplashEta('');
+  await new Promise(r => setTimeout(r, 1200));
+}
+
+function ensureRebootstrapNoticeUI() {
+  ensureSplashDecorations();
+  let panel = $('splashRebootstrapNotice');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'splashRebootstrapNotice';
+    panel.className = 'splash-rebootstrap-notice hidden';
+    panel.innerHTML = `
+      <div class="splash-rebootstrap-title">NEW BOOTSTRAP AVAILABLE</div>
+      <div id="splashRebootstrapText" class="splash-rebootstrap-text"></div>
+      <div class="splash-rebootstrap-actions">
+        <button id="splashRebootstrapApply" class="btn btn-ok splash-rebootstrap-btn" type="button">Yes, use latest bootstrap</button>
+        <button id="splashRebootstrapLater" class="btn splash-rebootstrap-btn" type="button">No, thank you</button>
+      </div>`;
+    const overlay = $('splashOverlay');
+    overlay?.appendChild(panel);
+  }
+
+  const laterBtn = $('splashRebootstrapLater');
+  if (laterBtn && !laterBtn.dataset.bound) {
+    laterBtn.dataset.bound = '1';
+    laterBtn.addEventListener('click', () => {
+      hideRebootstrapNotice({ disable: false, snoozeMs: REBOOTSTRAP_SNOOZE_MS });
+    });
+  }
+  const applyBtn = $('splashRebootstrapApply');
+  if (applyBtn && !applyBtn.dataset.bound) {
+    applyBtn.dataset.bound = '1';
+    applyBtn.addEventListener('click', () => {
+      applyRebootstrapFromNotice().catch((err) => {
+        console.warn('[rebootstrap] apply action failed:', err?.message || err);
+      });
+    });
+  }
+}
+
+function setRebootstrapNoticeBusy(isBusy) {
+  const applyBtn = $('splashRebootstrapApply');
+  const laterBtn = $('splashRebootstrapLater');
+  if (applyBtn) {
+    applyBtn.disabled = !!isBusy;
+    applyBtn.textContent = isBusy ? 'Downloading...' : 'Yes, use latest bootstrap';
+  }
+  if (laterBtn) laterBtn.disabled = !!isBusy;
+}
+
+function showRebootstrapNotice(candidate) {
+  ensureRebootstrapNoticeUI();
+  const panel = $('splashRebootstrapNotice');
+  const text = $('splashRebootstrapText');
+  if (!panel || !text) return;
+
+  const savedText = candidate.estimatedSavedSeconds > 60
+    ? formatETA(candidate.estimatedSavedSeconds).replace(/^~/, '').replace(/\s*remaining$/i, '').trim()
+    : 'a short amount of time';
+  text.innerHTML =
+    `A more recent bootstrap is available. It is ${candidate.leadBlocks.toLocaleString()} blocks ahead ` +
+    `of your current local height and could save you around <span class="splash-rebootstrap-em">${savedText}</span> of sync time.<br><br>` +
+    `Would you like to switch to this newer checkpoint to speed up synchronization?`;
+
+  panel.classList.remove('hidden');
+  document.body.classList.add('splash-rebootstrap-visible');
+  setRebootstrapNoticeBusy(false);
+  rebootstrapAdvisorState.noticeVisible = true;
+  rebootstrapAdvisorState.noticeExpiresAt = Date.now() + REBOOTSTRAP_NOTICE_TTL_MS;
+  rebootstrapAdvisorState.candidate = candidate;
+}
+
+function hideRebootstrapNotice({ disable = false, snoozeMs = 0 } = {}) {
+  const panel = $('splashRebootstrapNotice');
+  if (panel) panel.classList.add('hidden');
+  document.body.classList.remove('splash-rebootstrap-visible');
+  rebootstrapAdvisorState.noticeVisible = false;
+  rebootstrapAdvisorState.noticeExpiresAt = 0;
+  rebootstrapAdvisorState.candidate = null;
+  setRebootstrapNoticeBusy(false);
+  if (disable) rebootstrapAdvisorState.enabled = false;
+  if (snoozeMs > 0) rebootstrapAdvisorState.dismissedUntil = Date.now() + snoozeMs;
+}
+
+async function applyRebootstrapFromNotice() {
+  if (rebootstrapAdvisorState.applying) return;
+  const candidate = rebootstrapAdvisorState.candidate;
+  if (!candidate) return;
+
+  rebootstrapAdvisorState.applying = true;
+  setRebootstrapNoticeBusy(true);
+
+  try {
+    const statusNow = await window.ioc.status().catch(() => null);
+    const localBlocksNow = Number(statusNow?.chain?.blocks || state.blocks || 0);
+    const remoteNow = await window.ioc.getDailyBootstrapMetadata();
+    if (!remoteNow?.ok || !Number.isFinite(Number(remoteNow.height))) {
+      throw new Error('Could not refresh daily bootstrap metadata');
+    }
+    const remoteHeightNow = Number(remoteNow.height);
+    const leadNow = remoteHeightNow - localBlocksNow;
+    if (leadNow <= REBOOTSTRAP_REMOTE_LEAD_BLOCKS) {
+      hideRebootstrapNotice({ disable: true });
+      updateSplashStatus('Continuing local sync...');
+      setSplashMeta(`Current block: ${localBlocksNow.toLocaleString()} - Local sync is already close enough`);
+      return;
+    }
+
+    const backupRes = await window.ioc.createRebootstrapBackup({
+      reason: 'daily-bootstrap-refresh',
+      localBlock: localBlocksNow,
+      remoteBootstrapBlock: remoteHeightNow,
+      remoteReleaseTitle: remoteNow.title || '',
+      checkedAt: new Date().toISOString()
+    });
+    if (!backupRes?.ok) {
+      throw new Error(backupRes?.error || 'Backup creation failed');
+    }
+
+    hideRebootstrapNotice({ disable: true });
+    await runRebootstrapFlow();
+  } catch (err) {
+    console.error('[rebootstrap] apply failed, continuing local sync:', err);
+    try {
+      await window.ioc.restartDaemon();
+    } catch (_) {}
+    setSplashStepFlow('startup');
+    // Return to the standard syncing splash immediately after failure.
+    setSplashPhase('syncing');
+    updateSplashStatus('Syncing with the network');
+    setSplashMeta('');
+    setSplashEta('Calculating ETA...');
+    hideRebootstrapNotice({ disable: true, snoozeMs: REBOOTSTRAP_SNOOZE_MS });
+    alert(`Could not apply the newer bootstrap.\n\n${err?.message || String(err)}\n\nContinuing with local sync.`);
+  } finally {
+    rebootstrapAdvisorState.applying = false;
+    setRebootstrapNoticeBusy(false);
+  }
+}
+
+async function maybeEvaluateDailyRebootstrap(localBlocks) {
+  if (!splashState.visible || splashState.phase !== 'syncing') return;
+  if (!rebootstrapAdvisorState.enabled || rebootstrapAdvisorState.applying) return;
+  if (Date.now() < rebootstrapAdvisorState.dismissedUntil) return;
+  if (!window.ioc?.getDailyBootstrapMetadata || !window.ioc?.createRebootstrapBackup) {
+    rebootstrapAdvisorState.enabled = false;
+    return;
+  }
+
+  primeRebootstrapRemoteMetadata();
+
+  if (!rebootstrapAdvisorState.remoteChecked || !rebootstrapAdvisorState.remoteMeta) return;
+
+  const remoteHeight = Number(rebootstrapAdvisorState.remoteMeta.height || 0);
+  if (!Number.isFinite(remoteHeight) || remoteHeight <= 0) {
+    rebootstrapAdvisorState.enabled = false;
+    return;
+  }
+
+  const leadBlocks = remoteHeight - localBlocks;
+  if (leadBlocks <= REBOOTSTRAP_REMOTE_LEAD_BLOCKS) {
+    if (rebootstrapAdvisorState.noticeVisible) {
+      hideRebootstrapNotice({ disable: true });
+    }
+    rebootstrapAdvisorState.enabled = false;
+    return;
+  }
+
+  if (rebootstrapAdvisorState.noticeVisible) {
+    if (Date.now() > rebootstrapAdvisorState.noticeExpiresAt) {
+      hideRebootstrapNotice({ disable: false, snoozeMs: REBOOTSTRAP_SNOOZE_MS });
+      return;
+    }
+    const currentLead = remoteHeight - localBlocks;
+    if (currentLead <= REBOOTSTRAP_REMOTE_LEAD_BLOCKS) {
+      hideRebootstrapNotice({ disable: true });
+    }
+    return;
+  }
+
+  if (!splashState.etaReadySince) return;
+  if ((Date.now() - splashState.etaReadySince) < REBOOTSTRAP_NOTICE_AFTER_ETA_MS) return;
+
+  const elapsedMs = Date.now() - (rebootstrapAdvisorState.startedAt || Date.now());
+  const progressed = localBlocks - (rebootstrapAdvisorState.startBlock || localBlocks);
+  const blocksPerSec = progressed / Math.max(1, elapsedMs / 1000);
+  const sampleRate = blocksPerSec > 0 ? blocksPerSec : (splashState.lastBlocksPerSec || 0);
+  if (!(sampleRate > 0)) return;
+
+  const catchupSeconds = leadBlocks / sampleRate;
+  const estimatedSavedSeconds = Math.max(0, catchupSeconds - REBOOTSTRAP_OVERHEAD_SECONDS);
+  showRebootstrapNotice({
+    remoteHeight,
+    leadBlocks,
+    estimatedSavedSeconds,
+    sampledBlocksPerSec: sampleRate,
+    observedAt: Date.now()
+  });
+}
+
 /**
  * Update sync bar and text based on chain state.
  * @param {number} blocks - current local block height
@@ -406,47 +1456,84 @@ function setupBootstrapHandlers() {
  * @param {number} verificationProgress - 0-1 progress value (optional)
  * @param {number} remoteTip - explicit remote tip if available (used only for progress bar math)
  */
+function isChainFullySynced(blocks, targetHeight, verificationProgress, remoteTip) {
+  const b = Number(blocks) || 0;
+  const tip = Number(remoteTip) || 0;
+  const target = Number(targetHeight) || 0;
+  const vp = Number(verificationProgress);
+
+  if (tip > 0) return b >= tip;
+  if (target > 0 && target !== b) return b >= target;
+  if (Number.isFinite(vp)) return vp >= 0.9999;
+  return false;
+}
+
+function showSyncLockNotice(anchorEl, message = SEND_DISABLED_SYNC_MESSAGE) {
+  if (!message) return;
+  let notice = $('syncLockNotice');
+  if (!notice) {
+    notice = document.createElement('div');
+    notice.id = 'syncLockNotice';
+    notice.className = 'sync-lock-notice';
+    document.body.appendChild(notice);
+  }
+  notice.textContent = message;
+  const r = anchorEl && typeof anchorEl.getBoundingClientRect === 'function'
+    ? anchorEl.getBoundingClientRect()
+    : null;
+  const left = r ? Math.round(r.left + (r.width / 2)) : Math.round(window.innerWidth / 2);
+  const top = r ? Math.round(r.top - 8) : 120;
+  notice.style.left = `${left}px`;
+  notice.style.top = `${top}px`;
+  notice.classList.add('show');
+  if (_syncLockNoticeTimer) clearTimeout(_syncLockNoticeTimer);
+  _syncLockNoticeTimer = setTimeout(() => {
+    notice.classList.remove('show');
+  }, 1900);
+}
+
+function wireSyncLockHoverHint(el) {
+  if (!el || el.dataset.syncLockHintWired === '1') return;
+  el.dataset.syncLockHintWired = '1';
+  el.addEventListener('mouseenter', () => {
+    if (!state.synced && !document.body.classList.contains('splash-active')) {
+      showSyncLockNotice(el);
+    }
+  });
+}
+
+function updateSendLockState(isSynced) {
+  const locked = !isSynced;
+  document.body.classList.toggle('wallet-not-synced', locked);
+
+  const targets = [$('sendBtn'), $('widget-send-btn'), $('doSend')];
+  for (const btn of targets) {
+    if (!btn) continue;
+    wireSyncLockHoverHint(btn);
+    btn.classList.toggle('send-locked', locked);
+    if (locked) {
+      btn.setAttribute('aria-disabled', 'true');
+      btn.setAttribute('title', SEND_DISABLED_SYNC_MESSAGE);
+    } else {
+      btn.removeAttribute('aria-disabled');
+      btn.removeAttribute('title');
+    }
+  }
+}
+
 function updateSyncDisplay(blocks, targetHeight, verificationProgress, remoteTip) {
-  const bar = $('syncbar');
-  const t = $('syncText');
   const wrap = document.querySelector('#tab-overview .sync-wrap');
 
-  // A) Always store blocks in state immediately (before any conditional logic)
+  // Always store blocks in state immediately (before any conditional logic)
   state.blocks = blocks;
 
-  // B) Calculate progress bar percentage (remoteTip can be used here for smoother pct)
-  const pctTarget = remoteTip > 0 ? remoteTip : (targetHeight > 0 ? targetHeight : 1);
-  let pct;
-  if (pctTarget > 0 && blocks > 0) {
-    pct = Math.round((blocks / pctTarget) * 100);
-  } else if (typeof verificationProgress === 'number' && verificationProgress > 0) {
-    pct = Math.round(verificationProgress * 100);
-  } else {
-    pct = 0;
-  }
-  pct = Math.max(0, Math.min(100, pct));
-
-  // C) Synced check uses ONLY targetHeight (NOT remoteTip)
-  const isSynced = targetHeight > 0 && blocks >= targetHeight;
-
-  // Store synced state for staking icon
+  const isSynced = isChainFullySynced(blocks, targetHeight, verificationProgress, remoteTip);
   state.synced = isSynced;
+  updateSendLockState(isSynced);
 
-  if (isSynced) {
-    // When synced: hide the entire sync row (no gap left behind)
-    if (wrap) wrap.style.display = 'none';
-  } else {
-    // While NOT synced: always show the bottom sync row
-    if (wrap) wrap.style.display = '';
-    if (bar) {
-      bar.style.display = '';
-      bar.style.width = pct + '%';
-    }
-    // Text: "Syncing wallet (BLOCK)" - plain integer, no commas
-    if (t) {
-      t.textContent = `Syncing wallet (${blocks})`;
-    }
-  }
+  // Overview sync line/bar are intentionally hidden; warning badge + send lock
+  // communicate sync state in the active UI.
+  if (wrap) wrap.style.display = 'none';
 
   if (wrap) wrap.classList.toggle('synced', isSynced);
 
@@ -456,35 +1543,27 @@ function updateSyncDisplay(blocks, targetHeight, verificationProgress, remoteTip
 
 // Legacy wrapper for compatibility
 function setSync(pct, text) {
-  // This function is kept for any external calls but updateSyncDisplay is preferred
-  const bar = $('syncbar');
-  const t = $('syncText');
+  // Legacy wrapper kept for compatibility. We still maintain lock state.
   const wrap = document.querySelector('#tab-overview .sync-wrap');
+  const isSynced = (pct || 0) >= 100;
+  state.synced = isSynced;
+  updateSendLockState(isSynced);
 
-  if ((pct || 0) >= 100) {
-    if (bar) bar.style.display = 'none';
-    if (t) {
-      const syncedText = (text || '').trim().replace(/^Syncing wallet/i, 'Synced');
-      t.textContent = syncedText || 'Synced';
-    }
-    if (wrap) wrap.classList.add('synced');
-  } else {
-    if (bar) {
-      bar.style.display = '';
-      bar.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
-    }
-    if (t) t.textContent = text || '';
-    if (wrap) wrap.classList.remove('synced');
+  if (wrap) {
+    wrap.style.display = 'none';
+    wrap.classList.toggle('synced', isSynced);
   }
 
   const syncChip = $('ic-sync');
-  if (syncChip) syncChip.classList.toggle('ok', (pct || 0) >= 100);
+  if (syncChip) syncChip.classList.toggle('ok', isSynced);
 }
 
 
 function setPeers(n) {
   state.peers = n || 0;
   const chip = $('ic-peers');
+  const splashPeers = $('splashDebugConnections');
+  if (splashPeers) splashPeers.textContent = `Connections: ${state.peers}`;
   if (chip) {
     // Tooltip shows peers + single local block height (no commas, no network tip)
     let tooltip = `Peers: ${state.peers}`;
@@ -503,7 +1582,7 @@ function setLock(unlocked, encrypted) {
   const chip = $('ic-lock');
 
   if (state.encrypted === false) {
-    // Unencrypted wallet — grey lock, open padlock shape
+    // Unencrypted wallet â€” grey lock, open padlock shape
     p.setAttribute('d', 'M9 10V7a3 3 0 0 1 6 0h2a5 5 0 1 0-10 0v3H7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2H9zm3 8a2 2 0 1 1 0-4 2 2 0 0 1 0 4z');
     if (chip) { chip.classList.remove('ok'); chip.title = 'Wallet is unencrypted (click to encrypt it)'; }
   } else if (state.unlocked) {
@@ -559,6 +1638,31 @@ function setStaking(on, amount, stakingInfo, balance) {
     chip.title = tooltip;
   }
   const s = $('staking'); if (s) s.textContent = on ? Number(amount || 0).toLocaleString() : '0';
+}
+
+function formatBalanceMarkup(amount) {
+  const value = Number.isFinite(amount) ? amount : 0;
+  const parts = new Intl.NumberFormat(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 3
+  }).formatToParts(value);
+  const whole = [];
+  const frac = [];
+  let seenDecimal = false;
+  for (const part of parts) {
+    if (part.type === 'decimal') {
+      seenDecimal = true;
+      frac.push(part.value);
+      continue;
+    }
+    if (seenDecimal || part.type === 'fraction') frac.push(part.value);
+    else whole.push(part.value);
+  }
+  const wholeText = whole.join('') || '0';
+  const fracText = frac.join('');
+  return fracText
+    ? `<span class="balance-whole">${wholeText}</span><span class="balance-frac">${fracText}</span>`
+    : `<span class="balance-whole">${wholeText}</span>`;
 }
 
 let __resizeRAF=null;
@@ -621,16 +1725,16 @@ async function refresh() {
       if (last.bal === null || last.bal !== bal) {
         const balText = (Math.round(bal * 1000) / 1000).toLocaleString();
         const el = $('big-balance');
-        if (el) el.textContent = balText;
+        if (el) el.innerHTML = formatBalanceMarkup(bal);
         const wBal = $('widget-balance');
-        if (wBal) wBal.textContent = balText;
+        if (wBal) wBal.innerHTML = formatBalanceMarkup(bal);
         last.bal = bal;
       }
-      // Always re-fit: cheap canvas op, ensures correct sizing after compact→full transition
+      // Always re-fit: cheap canvas op, ensures correct sizing after compactâ†’full transition
       fitBalance();
     }
 
-    // Pending (unconfirmed) balance display — IOCoin daemon uses "pending" field from getinfo
+    // Pending (unconfirmed) balance display â€” IOCoin daemon uses "pending" field from getinfo
     const unconf = Number(info.pending || 0);
     const pendEl = $('pending-line'), pendAmt = $('pending-amt');
     const wPendEl = $('widget-pending'), wPendAmt = $('widget-pending-amt');
@@ -665,26 +1769,22 @@ async function refresh() {
         const blocksRemaining = networkTip > 0 ? networkTip - blocks : 0;
 
         // Determine if we're close enough to hide splash
-        const closeEnough = networkTip > 0 && blocksRemaining <= SPLASH_BLOCKS_THRESHOLD;
+        const heightSynced = networkTip > 0 && blocks >= networkTip;
 
-        // Fallback: if verificationprogress >= 0.9999 the daemon considers itself synced
         const vpSynced = vp >= 0.9999;
 
-        // Fallback: if remoteTip is unavailable but blocks haven't moved for 30s, assume synced
-        if (!splashState.stalledSince) splashState.stalledSince = null;
-        if (blocks > 0 && blocks === last.blocks) {
-          if (!splashState.stalledSince) splashState.stalledSince = Date.now();
-        } else {
-          splashState.stalledSince = null;
-        }
-        const stalledLong = splashState.stalledSince && (Date.now() - splashState.stalledSince > 30000);
+        const fullySynced = heightSynced || (networkTip <= 0 && vpSynced);
 
-        if (closeEnough || vpSynced || stalledLong) {
-          // Synced — hide splash and show wallet
-          const reason = closeEnough ? `within ${SPLASH_BLOCKS_THRESHOLD} blocks` : vpSynced ? `vp=${vp}` : 'stalled 30s';
+        if (fullySynced) {
+          // Synced â€” hide splash and show wallet
+          const reason = heightSynced ? `height=${blocks}` : `vp=${vp}`;
           console.log(`[splash] Sync complete (${reason}), hiding splash`);
           splashState.validStatusReceived = true;
+          hideRebootstrapNotice({ disable: true });
           hideSplash();
+          if (document.body.classList.contains('compact-mode') && window.ioc?.setCompactMode) {
+            Promise.resolve(window.ioc.setCompactMode(true)).catch(() => {});
+          }
           hideConnectBanner();
           connectionState.connected = true;
           connectionState.attempts = 0;
@@ -695,6 +1795,9 @@ async function refresh() {
             // Transition from connecting to syncing phase
             startSplashSyncPhase(blocks);
           }
+          maybeEvaluateDailyRebootstrap(blocks).catch((err) => {
+            console.warn('[rebootstrap] advisor error, continuing local sync:', err?.message || err);
+          });
           // Splash text is updated by the standalone logHeight poller
           // (started in startSplashSyncPhase). No update here.
           // Mark as connected (daemon is responding)
@@ -702,12 +1805,12 @@ async function refresh() {
           connectionState.attempts = 0;
         } else {
           // Have headers but no blocks yet - still warming up
-          updateSplashStatus('Loading daemon…');
+          updateSplashStatus('Loading daemonâ€¦');
         }
       } else {
         // No chain data yet - still warming up
         if (!splashState.longWaitShown) {
-          updateSplashStatus('Loading daemon…');
+          updateSplashStatus('Loading daemonâ€¦');
         }
       }
     } else {
@@ -730,7 +1833,9 @@ async function refresh() {
       last.headers = targetHeight;
     }
 
-    setPeers(st?.peers || 0);
+    if (typeof st?.peers === 'number' && Number.isFinite(st.peers)) {
+      setPeers(st.peers);
+    }
 
     const locked = st?.lockst?.isLocked;
     const isEncrypted = st?.lockst?.isEncrypted;
@@ -739,7 +1844,7 @@ async function refresh() {
       setLock(!locked, typeof isEncrypted === 'boolean' ? isEncrypted : undefined);
     }
 
-    // staking ON flag — only true when daemon reports actively staking (not just enabled)
+    // staking ON flag â€” only true when daemon reports actively staking (not just enabled)
     const stakingOn = !!(st?.staking?.staking);
     // staking AMOUNT (prefer getinfo.stake, fallback to getstakinginfo fields)
     const stakingAmt = Number(
@@ -777,7 +1882,7 @@ async function refresh() {
             'Could not connect to iocoind. Ensure the daemon is installed and running.'
           );
         } else {
-          updateSplashStatus(`Starting daemon… (attempt ${connectionState.attempts}/${connectionState.maxAttempts})`);
+          updateSplashStatus(`Starting daemonâ€¦ (attempt ${connectionState.attempts}/${connectionState.maxAttempts})`);
         }
       } else {
         if (connectionState.attempts >= connectionState.maxAttempts) {
@@ -787,7 +1892,7 @@ async function refresh() {
             'Could not connect to iocoind. Ensure the daemon is installed and running.'
           );
         } else {
-          showConnectBanner(`Loading daemon… (attempt ${connectionState.attempts}/${connectionState.maxAttempts})`);
+          showConnectBanner(`Loading daemonâ€¦ (attempt ${connectionState.attempts}/${connectionState.maxAttempts})`);
         }
       }
     }
@@ -809,7 +1914,7 @@ async function refresh() {
       // Faster polling during splash sync phase so block count updates in real time
       const isSplashSync = splashState.visible && splashState.phase === 'syncing';
       const base = isSplashSync
-        ? 500                          // splash sync: 500ms — match debug.log speed
+        ? SPLASH_SYNC_REFRESH_INTERVAL_MS
         : vp < 0.999
           ? (isIntel ? 3000 : 1500)    // syncing (post-splash): 3s Intel, 1.5s ARM
           : (isIntel ? 8000 : 4000);   // synced:  8s Intel, 4s ARM
@@ -823,20 +1928,319 @@ async function refresh() {
   }
 }
 
-async function loadHistory_OLD() {
-  const rows = await window.ioc.listTx(50);
-  const tbody = $('txrows'); if (!tbody) return;
-  tbody.innerHTML = '';
+function enforceHistoryTableFullWidth() {
+  const panelInner = document.querySelector('#tab-history .panel-inner');
+  if (panelInner) {
+    panelInner.style.setProperty('display', 'flex', 'important');
+    panelInner.style.setProperty('align-items', 'stretch', 'important');
+    panelInner.style.setProperty('width', '100%', 'important');
+  }
 
-  const reversed = rows.slice().reverse();
+  const table = document.querySelector('#tab-history table.tx');
+  if (!table) return;
 
-  reversed.forEach(t => {
-    const tr = document.createElement('tr');
-    const _d = new Date((t.timereceived || t.time || 0) * 1000);
-    const when = _d.toLocaleDateString(undefined, {year:'numeric',month:'numeric',day:'numeric'}) + ' ' + _d.toLocaleTimeString();
-    tr.innerHTML = `<td class="col-when">${when}</td><td class="col-amt">${t.amount || 0}</td><td class="col-addr">${t.address || t.txid || ""}</td>`;
-    tbody.appendChild(tr);
+  table.style.setProperty('display', 'table', 'important');
+  table.style.setProperty('width', '100%', 'important');
+  table.style.setProperty('min-width', '100%', 'important');
+  table.style.setProperty('max-width', '100%', 'important');
+  table.style.setProperty('margin', '0', 'important');
+  table.style.setProperty('table-layout', 'fixed', 'important');
+
+  let colgroup = table.querySelector('colgroup[data-force-full-width="1"]');
+  const expectedCols = 4;
+  if (!colgroup || colgroup.querySelectorAll('col').length !== expectedCols) {
+    table.querySelectorAll('colgroup').forEach(cg => cg.remove());
+    colgroup = document.createElement('colgroup');
+    colgroup.setAttribute('data-force-full-width', '1');
+    colgroup.appendChild(document.createElement('col'));
+    colgroup.appendChild(document.createElement('col'));
+    colgroup.appendChild(document.createElement('col'));
+    colgroup.appendChild(document.createElement('col'));
+    table.insertBefore(colgroup, table.firstChild);
+  }
+
+  const cols = colgroup.querySelectorAll('col');
+  if (cols[0]) cols[0].style.width = '25%';
+  if (cols[1]) cols[1].style.width = '10%';
+  if (cols[2]) cols[2].style.width = '45%';
+  if (cols[3]) cols[3].style.width = '20%';
+
+  table.querySelectorAll('thead th, tbody td').forEach(cell => {
+    cell.style.textAlign = 'left';
   });
+  table.querySelectorAll('thead th:nth-child(4), tbody td:nth-child(4)').forEach(cell => {
+    cell.style.textAlign = 'center';
+  });
+}
+
+async function loadHistory() {
+  const tbody = $('txrows');
+  if (!tbody) return;
+
+  try {
+    const rows = await window.ioc.listTx(50);
+    tbody.innerHTML = '';
+
+    const sorted = (rows || []).slice().sort((a, b) => ((b.timereceived ?? b.time) || 0) - ((a.timereceived ?? a.time) || 0));
+    sorted.forEach(t => {
+      const tr = document.createElement('tr');
+      const d = new Date(((t.timereceived ?? t.time) || 0) * 1000);
+      const when = d.toLocaleDateString(undefined, { year: 'numeric', month: 'numeric', day: 'numeric' }) + ' ' + d.toLocaleTimeString();
+      const amt = Number(t.amount || 0);
+      const address = (t.address || '').toString().trim() || '-';
+      const txid = (t.txid || '').toString().trim();
+      const isPending = (t.confirmations === 0);
+
+      const whenCell = document.createElement('td');
+      whenCell.className = 'c-when';
+      whenCell.textContent = when;
+      if (isPending) {
+        const pending = document.createElement('span');
+        pending.className = 'tx-pending';
+        pending.textContent = 'pending';
+        whenCell.appendChild(document.createTextNode(' '));
+        whenCell.appendChild(pending);
+      }
+
+      const amountCell = document.createElement('td');
+      amountCell.className = 'c-amt';
+      amountCell.textContent = String(amt);
+
+      const addressCell = document.createElement('td');
+      addressCell.className = 'c-addr';
+      addressCell.textContent = address;
+      addressCell.title = address;
+
+      const txCell = document.createElement('td');
+      txCell.className = 'c-tx';
+      if (txid) {
+        const txBtn = document.createElement('button');
+        txBtn.type = 'button';
+        txBtn.className = 'btn sm tx-open-btn';
+        txBtn.textContent = 'Open Tx';
+        txBtn.title = txid;
+        txBtn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (window.ioc && typeof window.ioc.openExternal === 'function') {
+            window.ioc.openExternal(`https://iocexplorer.online/#tx/${encodeURIComponent(txid)}`);
+          }
+        });
+        txCell.appendChild(txBtn);
+      } else {
+        txCell.textContent = '-';
+      }
+
+      tr.appendChild(whenCell);
+      tr.appendChild(amountCell);
+      tr.appendChild(addressCell);
+      tr.appendChild(txCell);
+      tbody.appendChild(tr);
+    });
+  } catch (_) {
+    // Keep UI responsive even if daemon is not ready.
+  } finally {
+    enforceHistoryTableFullWidth();
+  }
+}
+
+const SAVED_RECIPIENTS_KEY = 'ioc-saved-recipients-v1';
+let savedRecipientsEditingId = null;
+let sendModalSelectedRecipientId = '';
+
+function getSavedRecipients() {
+  try {
+    const raw = localStorage.getItem(SAVED_RECIPIENTS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function setSavedRecipients(items) {
+  localStorage.setItem(SAVED_RECIPIENTS_KEY, JSON.stringify(items));
+}
+
+function normalizeRecipientAlias(alias) {
+  return String(alias || '').trim();
+}
+
+function findSavedRecipientByAlias(alias, excludeId = '') {
+  const normalized = normalizeRecipientAlias(alias).toLowerCase();
+  return getSavedRecipients().find(r => r.id !== excludeId && normalizeRecipientAlias(r.alias).toLowerCase() === normalized);
+}
+
+function populateSavedRecipientsSelect() {
+  const list = $('sendRecipientMenuList');
+  if (!list) return;
+  const items = getSavedRecipients().slice().sort((a, b) => a.alias.localeCompare(b.alias));
+  list.innerHTML = '';
+  const menu = $('sendRecipientMenu');
+  if (menu) menu.classList.toggle('is-empty', !items.length);
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'send-recipient-item-empty';
+    empty.textContent = 'No recipients yet';
+    list.appendChild(empty);
+    return;
+  }
+  items.forEach(item => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'send-recipient-item';
+    btn.innerHTML = `<span class="alias">${item.alias}</span><span class="address">${item.address}</span>`;
+    btn.addEventListener('click', () => {
+      const addrInput = $('sendAddr');
+      if (addrInput) addrInput.value = item.address;
+      sendModalSelectedRecipientId = item.id;
+      setSendRecipientMenuOpen(false);
+      const amt = $('sendAmt');
+      if (amt) requestAnimationFrame(() => amt.focus());
+    });
+    list.appendChild(btn);
+  });
+}
+
+function setSendRecipientMenuOpen(open) {
+  const menu = $('sendRecipientMenu');
+  const btn = $('sendRecipientPickerBtn');
+  if (menu) menu.classList.toggle('hidden', !open);
+  if (btn) btn.classList.toggle('active', !!open);
+}
+
+function setSavedRecipientFormOpen(open) {
+  $('savedRecipientForm')?.classList.toggle('hidden', !open);
+  $('savedRecipientCreateBtn')?.classList.toggle('hidden', open);
+}
+
+function resetSavedRecipientForm() {
+  savedRecipientsEditingId = null;
+  if ($('savedRecipientAliasInput')) $('savedRecipientAliasInput').value = '';
+  if ($('savedRecipientAddressInput')) $('savedRecipientAddressInput').value = '';
+  if ($('savedRecipientErr')) $('savedRecipientErr').textContent = '';
+  if ($('savedRecipientSaveBtn')) $('savedRecipientSaveBtn').textContent = 'Save recipient';
+  $('savedRecipientCancelBtn')?.classList.add('hidden');
+  if ($('savedRecipientCancelBtn')) $('savedRecipientCancelBtn').textContent = 'Close';
+  setSavedRecipientFormOpen(false);
+}
+
+function editSavedRecipient(id) {
+  const item = getSavedRecipients().find(r => r.id === id);
+  if (!item) return;
+  savedRecipientsEditingId = id;
+  setSavedRecipientFormOpen(true);
+  if ($('savedRecipientAliasInput')) $('savedRecipientAliasInput').value = item.alias;
+  if ($('savedRecipientAddressInput')) $('savedRecipientAddressInput').value = item.address;
+  if ($('savedRecipientErr')) $('savedRecipientErr').textContent = '';
+  if ($('savedRecipientSaveBtn')) $('savedRecipientSaveBtn').textContent = 'Save changes';
+  $('savedRecipientCancelBtn')?.classList.remove('hidden');
+  if ($('savedRecipientCancelBtn')) $('savedRecipientCancelBtn').textContent = 'Close';
+  $('savedRecipientAliasInput')?.focus();
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {}
+  }
+  try {
+    const input = document.createElement('textarea');
+    input.value = text;
+    input.setAttribute('readonly', '');
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    input.style.pointerEvents = 'none';
+    document.body.appendChild(input);
+    input.focus();
+    input.select();
+    input.setSelectionRange(0, input.value.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(input);
+    return !!ok;
+  } catch {
+    return false;
+  }
+}
+
+function renderSavedRecipients() {
+  const grid = $('savedRecipientsGrid');
+  if (!grid) return;
+  const items = getSavedRecipients().slice().sort((a, b) => a.alias.localeCompare(b.alias));
+  grid.innerHTML = '';
+  grid.classList.toggle('saved-grid-empty', !items.length);
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'addr-card saved-recipient-card saved-recipient-empty';
+    empty.innerHTML = `<div class="saved-alias">No recipients yet</div>
+      <div class="saved-address">Save frequently used recipient addresses here to reuse them later.</div>`;
+    grid.appendChild(empty);
+    populateSavedRecipientsSelect();
+    return;
+  }
+  items.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'addr-card saved-recipient-card';
+    card.innerHTML = `<div class="saved-alias">${item.alias}</div>
+      <div class="saved-address">${item.address}</div>
+      <div class="saved-actions">
+        <span class="saved-flash" aria-live="polite"></span>
+        <button class="btn sm" type="button" data-action="copy">Copy</button>
+        <button class="btn sm" type="button" data-action="edit">Edit</button>
+        <button class="btn sm" type="button" data-action="delete">Delete</button>
+      </div>`;
+    card.querySelector('[data-action="copy"]').addEventListener('click', async () => {
+      const flash = card.querySelector('.saved-flash');
+      const ok = await copyTextToClipboard(item.address);
+      if (flash) {
+        flash.textContent = ok ? 'Copied to clipboard' : 'Could not copy';
+        flash.classList.add('visible');
+        setTimeout(() => {
+          flash.classList.remove('visible');
+          flash.textContent = '';
+        }, 1400);
+      }
+    });
+    card.querySelector('[data-action="edit"]').addEventListener('click', () => editSavedRecipient(item.id));
+    card.querySelector('[data-action="delete"]').addEventListener('click', () => {
+      if (!window.confirm(`Delete saved recipient "${item.alias}"?`)) return;
+      const next = getSavedRecipients().filter(r => r.id !== item.id);
+      setSavedRecipients(next);
+      if (savedRecipientsEditingId === item.id) resetSavedRecipientForm();
+      renderSavedRecipients();
+    });
+    grid.appendChild(card);
+  });
+  populateSavedRecipientsSelect();
+}
+
+function saveSavedRecipientFromForm() {
+  const alias = normalizeRecipientAlias($('savedRecipientAliasInput')?.value);
+  const address = ($('savedRecipientAddressInput')?.value || '').trim();
+  const errEl = $('savedRecipientErr');
+  if (errEl) errEl.textContent = '';
+  if (!alias || !address) {
+    if (errEl) errEl.textContent = 'Alias and address are required';
+    return;
+  }
+  if (findSavedRecipientByAlias(alias, savedRecipientsEditingId || '')) {
+    if (errEl) errEl.textContent = 'Alias already exists. Please choose a unique alias';
+    return;
+  }
+  const items = getSavedRecipients();
+  if (savedRecipientsEditingId) {
+    const idx = items.findIndex(r => r.id === savedRecipientsEditingId);
+    if (idx >= 0) {
+      items[idx] = { ...items[idx], alias, address };
+    }
+  } else {
+    items.push({ id: `sr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, alias, address });
+  }
+  setSavedRecipients(items);
+  resetSavedRecipientForm();
+  renderSavedRecipients();
 }
 
 async function loadAddrs() {
@@ -846,7 +2250,7 @@ async function loadAddrs() {
   xs.forEach(x => {
     const card = document.createElement('div');
     card.className = 'addr-card' + (x.change ? ' addr-change' : '');
-    const balText = typeof x.amount === 'number' ? `Balance: ${x.amount} IOC — Click to copy` : 'Click to copy';
+    const balText = typeof x.amount === 'number' ? `Balance: ${x.amount} IOC â€” Click to copy` : 'Click to copy';
     const displayLabel = x.change ? 'Change' : (x.label || 'Address');
     card.innerHTML = `<div class="label" title="Click to edit label" style="cursor:pointer">${displayLabel}</div>
       <div class="addr" title="${balText}" style="cursor:pointer;user-select:text">${x.address}</div>`;
@@ -854,30 +2258,36 @@ async function loadAddrs() {
     const addrEl = card.querySelector('.addr');
     // Click label to edit
     labelEl.addEventListener('click', () => {
+      const originalLabel = x.label || '';
       const input = document.createElement('input');
       input.type = 'text';
-      input.value = x.label || '';
+      input.value = originalLabel;
       input.placeholder = 'Label';
       input.style.cssText = 'width:100%;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.2);border-radius:4px;color:inherit;font:inherit;padding:2px 6px;';
       labelEl.replaceWith(input);
       input.focus();
       input.select();
-      const save = async () => {
-        const newLabel = (input.value || '').trim();
-        const res = await window.ioc.setLabel(x.address, newLabel);
-        if (res?.ok) x.label = newLabel;
+      const restore = () => {
         const newEl = document.createElement('div');
         newEl.className = 'label';
         newEl.title = 'Click to edit label';
         newEl.style.cursor = 'pointer';
         newEl.textContent = x.label || 'Address';
         input.replaceWith(newEl);
-        newEl.addEventListener('click', () => labelEl.click());
-        // Reload to get fresh data
         loadAddrs();
       };
+      const save = async () => {
+        const newLabel = (input.value || '').trim();
+        if (newLabel === originalLabel) {
+          restore();
+          return;
+        }
+        const res = await window.ioc.setLabel(x.address, newLabel);
+        if (res?.ok) x.label = newLabel;
+        restore();
+      };
       input.addEventListener('blur', save);
-      input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } if (e.key === 'Escape') { input.value = x.label || ''; input.blur(); } });
+      input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } if (e.key === 'Escape') { input.value = originalLabel; input.blur(); } });
     });
     // Click address to copy
     addrEl.addEventListener('click', () => {
@@ -895,8 +2305,18 @@ function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   $('tab-' + name).classList.remove('hidden');
   document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
-  if (name === 'history') loadHistory();
+  if (name === 'history') {
+    loadHistory();
+    requestAnimationFrame(() => {
+      enforceHistoryTableFullWidth();
+      setTimeout(enforceHistoryTableFullWidth, 120);
+    });
+  }
   if (name === 'address') loadAddrs();
+  if (name === 'recipients') {
+    resetSavedRecipientForm();
+    renderSavedRecipients();
+  }
   // Re-fit balance after switching to Overview (double RAF ensures layout is settled)
   if (name === 'overview') {
     requestAnimationFrame(() => requestAnimationFrame(() => fitBalance()));
@@ -930,23 +2350,23 @@ async function doEncrypt() {
   $('encryptErr').textContent = '';
   if (!pass) { $('encryptErr').textContent = 'Passphrase is required'; return; }
   if (pass !== confirm) { $('encryptErr').textContent = 'Passphrases do not match'; return; }
-  // Close modal and show splash BEFORE encrypt — daemon dies mid-RPC
+  // Close modal and show splash BEFORE encrypt â€” daemon dies mid-RPC
   $('encryptModal').classList.add('hidden');
   $('encryptPass').value = '';
   $('encryptPassConfirm').value = '';
   showSplash();
-  updateSplashStatus('Encrypting wallet…');
+  updateSplashStatus('Encrypting walletâ€¦');
   try {
     await window.ioc.rpc('encryptwallet', [pass]);
   } catch (_) {
-    // encryptwallet may error because daemon shuts down mid-RPC — that's expected
+    // encryptwallet may error because daemon shuts down mid-RPC â€” that's expected
   }
-  // Daemon is now dead — show restart message and restart
-  updateSplashStatus('Wallet encrypted. Restarting daemon…');
+  // Daemon is now dead â€” show restart message and restart
+  updateSplashStatus('Wallet encrypted. Restarting daemonâ€¦');
   try {
     const result = await window.ioc.restartDaemon();
     if (result?.ok) {
-      updateSplashStatus('Daemon restarted. Loading…');
+      updateSplashStatus('Daemon restarted. Loadingâ€¦');
       // Reset state so polling picks up the new encrypted status
       state.encrypted = null;
       connectionState.connected = false;
@@ -961,7 +2381,7 @@ async function doEncrypt() {
 
 async function onLockClick() {
   if (state.encrypted === false) {
-    // Wallet not encrypted — show encrypt modal
+    // Wallet not encrypted â€” show encrypt modal
     $('encryptPass').value = '';
     $('encryptPassConfirm').value = '';
     $('encryptErr').textContent = '';
@@ -1010,7 +2430,282 @@ async function createNewAddr() {
   }
 }
 
+const WALLET_HELP_TOPICS = {
+  'getting-started': {
+    title: 'Getting Started',
+    intro: 'Use this path on first launch to avoid most issues later.',
+    steps: [
+      { title: 'Sync first', detail: 'Sync must finish completely before using the wallet.' },
+      { title: 'Verify available amount', detail: 'Open Overview and confirm your available coin amount is correct.' },
+      { title: 'Create first receiving address', detail: 'Create your first receiving address in My Addresses by clicking + New Address.' }
+    ]
+  },
+  'overview-sync': {
+    title: 'Overview & Sync',
+    intro: 'This section tells you whether your wallet is ready to operate safely.',
+    steps: [
+      { title: 'Spendable balance', detail: 'TOTAL I/O AVAILABLE is your spendable balance now.' },
+      { title: 'Real staking activity', detail: 'STAKING only reflects real activity when unlocked, synced, and funded.' },
+      { title: 'Partial sync warning', detail: 'If sync is still running, balances and confirmations can look incomplete.' }
+    ]
+  },
+  sending: {
+    title: 'Sending I/O',
+    intro: 'Use this checklist every time you send to reduce mistakes.',
+    steps: [
+      { title: 'Set destination', detail: 'Open Send and paste the destination, or choose a saved Recipient.' },
+      { title: 'Choose fee mode', detail: 'Enter amount and pick fee mode: Fee on top or Fee included.' },
+      { title: 'Confirm before send', detail: 'You will be asked to confirm destination, amount, fee, and final debit total before sending.' },
+      { title: 'Adjust when funds are short', detail: 'If funds are short, reduce amount or switch fee mode and re-check total.' }
+    ]
+  },
+  addresses: {
+    title: 'My Addresses',
+    intro: 'Use this area to create and organize receiving addresses.',
+    steps: [
+      { title: 'Generate receiving address', detail: 'Click + New Address to generate a fresh receiving address.' },
+      { title: 'Use clear naming', detail: 'Use a clear Address Name so you can identify usage later.' },
+      { title: 'Share only receiver addresses', detail: 'Share only addresses from this section when receiving I/O.' },
+      { title: 'Label changes are local only', detail: 'Renaming an address only affects local labels, not blockchain data.' }
+    ]
+  },
+  recipients: {
+    title: 'Recipients',
+    intro: 'This is your trusted address book for outgoing transfers.',
+    steps: [
+      { title: 'Save frequent destinations', detail: 'Save frequent destinations with alias + full address.' },
+      { title: 'Copy and verify', detail: 'Use Copy for speed, but still verify before sending.' },
+      { title: 'Maintain clean entries', detail: 'Use Edit and Delete to keep entries clean and current.' },
+      { title: 'Final safety check', detail: 'Always verify recipient address in the Send modal.' }
+    ]
+  },
+  'wallet-tools': {
+    title: 'Wallet Tools',
+    intro: 'These actions are for maintenance and recovery workflows.',
+    steps: [
+      { title: 'Dump Wallet', detail: 'Dump Wallet exports keys/metadata for advanced recovery use.' },
+      { title: 'Import Wallet', detail: 'Import Wallet should only be used with trusted files from your own backups.' },
+      { title: 'Create Backup', detail: 'Create Backup should be done regularly and before major changes.' },
+      { title: 'Show Live Debug', detail: 'Show Live Debug helps inspect daemon/network behavior in real time.' }
+    ]
+  },
+  security: {
+    title: 'Security',
+    intro: 'Short rules that prevent high-impact user errors.',
+    steps: [
+      { title: 'Use strong credentials', detail: 'Use a strong, unique passphrase and never share it.' },
+      { title: 'Keep offline backup', detail: 'Keep at least one offline backup in a separate secure location.' },
+      { title: 'Verify destination every time', detail: 'Double-check destination addresses before every send.' },
+      { title: 'Avoid unknown import files', detail: 'Never import unknown dump files; protect your Windows account/session.' }
+    ]
+  },
+  'restore-wallet': {
+    title: 'Restore Wallet',
+    intro: 'Use this when moving to a new installation or recovering funds.',
+    steps: [
+      { title: 'Close app and daemon', detail: 'Fully close the wallet app and daemon.' },
+      { title: 'Open wallet data folder', detail: 'Go to C:\\Users\\<USERNAME>\\AppData\\Roaming\\IOCoin.' },
+      { title: 'Preserve current data', detail: '(Recommended) Rename current wallet.dat to wallet.dat.bak.' },
+      { title: 'Replace with your backup file', detail: 'Copy your backup wallet.dat into that folder, replacing the active one.' },
+      { title: 'Start and wait for sync', detail: 'Start the wallet normally and wait until it is fully synced.' }
+    ]
+  },
+  'peer-connections': {
+    title: 'Peer Connections',
+    intro: 'If peer count is too low, verify your config file.',
+    steps: [
+      { title: 'Open iocoin.conf', detail: 'Open iocoin.conf in C:\\Users\\<USERNAME>\\AppData\\Roaming\\IOCoin.' },
+      { title: 'Compare peer entries', detail: 'Check whether peer entries are missing or outdated (against the explorer).' },
+      { title: 'Add recent peers manually', detail: 'Get recent peers from the explorer/community list and add them manually, one per line.' },
+      { title: 'Use correct format', detail: 'Use this format: addnode=<IP>:<PORT>.' },
+      { title: 'Restart and validate', detail: 'Save the file, restart the wallet, and re-check peers in Live Debug.' }
+    ]
+  },
+  troubleshooting: {
+    title: 'Troubleshooting',
+    intro: 'Follow this order when something looks wrong.',
+    steps: [
+      { title: 'Confirm full sync first', detail: 'First confirm full sync; many "wrong balance" issues come from partial sync.' },
+      { title: 'Inspect network stability', detail: 'If network looks unstable, inspect peers indicator and open Live Debug.' },
+      { title: 'Read logs before restart', detail: 'If startup is slow, wait and read logs (Help > Live Debug) before forcing restarts.' },
+      { title: 'Escalate safely', detail: 'If behavior persists, manually back up wallet first (wallet.dat file within C:\\Users\\addri\\AppData\\Roaming\\IOCoin), then proceed with maintenance or contact the community for support.' }
+    ]
+  }
+};
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const HELP_KEYWORDS = [
+  'Sync',
+  'Show Live Debug',
+  'Create new recipient',
+  '+ New Address',
+  'Fee included',
+  'Fee on top',
+  'TOTAL I/O AVAILABLE',
+  'STAKING',
+  'Address Name',
+  'Chain Explorer',
+  'Open Explorer',
+  'Dump Wallet',
+  'Import Wallet',
+  'Create Backup',
+  'Live Debug',
+  'Wallet Tools',
+  'My Addresses',
+  'Recipients',
+  'Recipient',
+  'Copy',
+  'Edit',
+  'Delete',
+  'Restore Wallet',
+  'Peer Connections',
+  'wallet.dat',
+  'iocoin.conf',
+  'daemon',
+  'Help > Live Debug',
+  'Overview',
+  'Settings',
+  'Send'
+];
+
+const HELP_KEYWORD_REGEX = new RegExp(
+  `(^|[^A-Za-z0-9])(${HELP_KEYWORDS
+    .slice()
+    .map((k) => escapeHtml(k))
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|')})(?=$|[^A-Za-z0-9])`,
+  'gi'
+);
+
+function highlightHelpKeywords(text) {
+  return escapeHtml(text);
+}
+
+function initHelpCenter() {
+  const modal = $('helpCenterModal');
+  if (!modal || modal.dataset.helpCenterInit === '1') return;
+  modal.dataset.helpCenterInit = '1';
+
+  const nav = $('helpCenterNav');
+  const topicTitle = $('helpTopicTitle');
+  const topicIntro = $('helpTopicIntro');
+  const topicList = $('helpTopicList');
+  const closeButtons = [$('helpCenterClose'), $('helpCenterCloseTop')].filter(Boolean);
+
+  let activeTopic = nav?.querySelector('.help-topic-btn.active')?.dataset.topic || 'getting-started';
+
+  const getHelpCenterWindowContext = () => ({
+    compactMode: document.body.classList.contains('compact-mode'),
+    splashActive: document.body.classList.contains('splash-active'),
+    splashDebugOpen: document.body.classList.contains('splash-debug-open') || !!splashState.debugExpanded
+  });
+
+  async function syncHelpCenterWindow(open) {
+    if (!window.ioc?.setHelpCenterWindow) return;
+    try {
+      await window.ioc.setHelpCenterWindow(!!open, getHelpCenterWindowContext());
+    } catch (_) {}
+  }
+
+  const renderTopic = (topicKey) => {
+    const topic = WALLET_HELP_TOPICS[topicKey] || WALLET_HELP_TOPICS['getting-started'];
+    activeTopic = topicKey in WALLET_HELP_TOPICS ? topicKey : 'getting-started';
+    if (topicTitle) topicTitle.textContent = topic.title || '';
+    if (topicIntro) topicIntro.innerHTML = highlightHelpKeywords(topic.intro);
+    if (topicList) {
+      topicList.innerHTML = '';
+      const steps = Array.isArray(topic.steps) && topic.steps.length
+        ? topic.steps
+        : (Array.isArray(topic.items) ? topic.items : []);
+      for (const item of steps) {
+        const li = document.createElement('li');
+        if (item && typeof item === 'object') {
+          const title = document.createElement('span');
+          title.className = 'help-step-title';
+          title.textContent = item.title || '';
+          const detail = document.createElement('p');
+          detail.className = 'help-step-detail';
+          detail.innerHTML = highlightHelpKeywords(item.detail || '');
+          li.appendChild(title);
+          li.appendChild(detail);
+        } else {
+          li.innerHTML = highlightHelpKeywords(String(item || ''));
+        }
+        topicList.appendChild(li);
+      }
+    }
+    if (nav) {
+      nav.querySelectorAll('.help-topic-btn').forEach((btn) => {
+        const isActive = btn.dataset.topic === activeTopic;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-current', isActive ? 'true' : 'false');
+      });
+    }
+  };
+
+  const openHelpCenter = async (topicKey = activeTopic) => {
+    renderTopic(topicKey);
+    await syncHelpCenterWindow(true);
+    modal.classList.remove('hidden');
+  };
+  const closeHelpCenter = async () => {
+    modal.classList.add('hidden');
+    await syncHelpCenterWindow(false);
+  };
+
+  if (nav) {
+    nav.addEventListener('click', (e) => {
+      const btn = e.target.closest('.help-topic-btn');
+      if (!btn) return;
+      renderTopic(btn.dataset.topic || 'getting-started');
+    });
+  }
+
+  closeButtons.forEach((btn) => btn.addEventListener('click', closeHelpCenter));
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) closeHelpCenter();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'F1') {
+      e.preventDefault();
+      openHelpCenter();
+      return;
+    }
+    if (e.key === 'Escape' && !modal.classList.contains('hidden')) {
+      closeHelpCenter();
+    }
+  });
+
+  if (window.ioc?.onOpenHelpCenter) {
+    window.ioc.onOpenHelpCenter(() => {
+      openHelpCenter();
+    });
+  }
+
+  renderTopic(activeTopic);
+}
+
 function main() {
+  // Mount splash extras immediately for initial connecting phase.
+  ensureSplashDecorations();
+  setSplashStepFlow('startup');
+  setSplashPhase('connecting');
+  updateSplashStatus($('splashStatus')?.textContent || 'Loading daemon...');
+
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
   window.addEventListener('resize',()=>{if(__resizeRAF)cancelAnimationFrame(__resizeRAF);__resizeRAF=requestAnimationFrame(()=>{__resizeRAF=null;fitBalance();});});
 
@@ -1018,6 +2713,14 @@ function main() {
     // When returning to the app, refresh immediately; when hiding, the next tick will stretch.
     if (!document.hidden) refresh();
   });
+
+  if (window.ioc?.onSystemResume) {
+    window.ioc.onSystemResume(() => {
+      runResumeRecoveryFlow().catch(err => {
+        console.warn('[resume] Recovery flow failed:', err?.message || err);
+      });
+    });
+  }
 
   $('ic-lock').addEventListener('click', onLockClick);
   $('cancelUnlock').addEventListener('click', () => { $('unlockModal').classList.add('hidden'); $('pass').value=''; });
@@ -1028,42 +2731,197 @@ function main() {
   $('doEncrypt').addEventListener('click', doEncrypt);
   $('encryptPassConfirm').addEventListener('keydown', e => { if (e.key === 'Enter') doEncrypt(); if (e.key === 'Escape') {$('encryptModal').classList.add('hidden');} });
 
-  $('sendBtn').addEventListener('click', () => {
+  $('sendBtn').addEventListener('click', (e) => {
+    if (!state.synced) {
+      showSyncLockNotice(e.currentTarget);
+      return;
+    }
     if (state.encrypted === false) {
       $('encryptModal').classList.remove('hidden');
       return;
     }
-    const e=$('sendErr'); if(e) e.textContent=''; $('sendModal').classList.remove('hidden');
+    openSendModal(e.currentTarget);
   });
   // Widget send button (compact mode)
   const widgetSendBtn = $('widget-send-btn');
   if (widgetSendBtn) {
-    widgetSendBtn.addEventListener('click', () => {
+    widgetSendBtn.addEventListener('click', (e) => {
+      if (!state.synced) {
+        showSyncLockNotice(e.currentTarget);
+        return;
+      }
       if (state.encrypted === false) {
         $('encryptModal').classList.remove('hidden');
         return;
       }
-      $('sendModal').classList.remove('hidden');
+      openSendModal(e.currentTarget);
     });
   }
-  $('cancelSend').addEventListener('click', () => $('sendModal').classList.add('hidden'));
+  updateSendLockState(state.synced);
+  function getSendFeeMode() {
+    return document.querySelector('input[name="sendFeeMode"]:checked')?.value || 'top';
+  }
+  function formatSendAmount(v) {
+    return Number(v || 0).toLocaleString(undefined, {
+      minimumFractionDigits: 3,
+      maximumFractionDigits: 3
+    }) + ' IOC';
+  }
+  function updateSendSummary() {
+    const summary = $('sendSummary');
+    const recipientEl = $('sendSummaryRecipient');
+    const feeEl = $('sendSummaryFee');
+    const totalEl = $('sendSummaryTotal');
+    const errEl = $('sendErr');
+    if (!summary || !recipientEl || !feeEl || !totalEl) return;
+
+    const amount = parseFloat(($('sendAmt').value || '').trim());
+    const mode = getSendFeeMode();
+    if (!(amount > 0)) {
+      summary.classList.add('hidden');
+      return;
+    }
+
+    const recipientAmount = mode === 'included'
+      ? Math.max(0, amount - SEND_FEE_IOC)
+      : amount;
+    const totalDebited = mode === 'included'
+      ? amount
+      : amount + SEND_FEE_IOC;
+
+    recipientEl.textContent = formatSendAmount(recipientAmount);
+    feeEl.textContent = formatSendAmount(SEND_FEE_IOC);
+    totalEl.textContent = formatSendAmount(totalDebited);
+    summary.classList.remove('hidden');
+
+    if (errEl && errEl.textContent && /fee|insufficient|exceeds/i.test(errEl.textContent)) {
+      errEl.textContent = '';
+    }
+  }
+  function openSendModal(triggerEl = null) {
+    const errEl = $('sendErr');
+    const summary = $('sendSummary');
+    if (!state.synced) {
+      if (errEl) errEl.textContent = SEND_DISABLED_SYNC_MESSAGE;
+      showSyncLockNotice(triggerEl || $('sendBtn') || $('widget-send-btn'));
+      const sheet = $('sendModal')?.querySelector('.sheet');
+      if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
+      return false;
+    }
+    if (errEl) errEl.textContent = '';
+    if (summary) summary.classList.add('hidden');
+    const topMode = document.querySelector('input[name="sendFeeMode"][value="top"]');
+    if (topMode) topMode.checked = true;
+    sendModalSelectedRecipientId = '';
+    if ($('sendAddr')) $('sendAddr').value = '';
+    if ($('sendAmt')) $('sendAmt').value = '';
+    const sheet = $('sendModal')?.querySelector('.sheet');
+    if (sheet) sheet.classList.remove('shake');
+    $('sendModal').classList.remove('hidden');
+    populateSavedRecipientsSelect();
+    setSendRecipientMenuOpen(false);
+    updateSendSummary();
+    return true;
+  }
+  $('sendAmt')?.addEventListener('input', updateSendSummary);
+  $('sendAddr')?.addEventListener('input', () => {
+    sendModalSelectedRecipientId = '';
+  });
+  $('sendRecipientPickerBtn')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const menu = $('sendRecipientMenu');
+    setSendRecipientMenuOpen(!!menu?.classList.contains('hidden'));
+    populateSavedRecipientsSelect();
+  });
+  document.addEventListener('click', (e) => {
+    const modal = $('sendModal');
+    if (!modal || modal.classList.contains('hidden')) return;
+    const menu = $('sendRecipientMenu');
+    const pickerBtn = $('sendRecipientPickerBtn');
+    if (!menu || menu.classList.contains('hidden')) return;
+    const target = e.target;
+    if (menu.contains(target) || pickerBtn?.contains(target)) return;
+    setSendRecipientMenuOpen(false);
+  });
+  document.querySelectorAll('input[name="sendFeeMode"]').forEach(el => {
+    el.addEventListener('change', updateSendSummary);
+  });
+  $('cancelSend').addEventListener('click', () => {
+    setSendRecipientMenuOpen(false);
+    const sheet = $('sendModal')?.querySelector('.sheet');
+    if (sheet) sheet.classList.remove('shake');
+    $('sendModal').classList.add('hidden');
+  });
   $('doSend').addEventListener('click', async () => {
+    const errEl = $('sendErr');
+    if (!state.synced) {
+      if (errEl) errEl.textContent = SEND_DISABLED_SYNC_MESSAGE;
+      showSyncLockNotice($('doSend'));
+      const sheet = $('sendModal')?.querySelector('.sheet');
+      if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
+      return;
+    }
     const a = ($('sendAddr').value||'').trim();
     const n = parseFloat(($('sendAmt').value||'').trim());
     if (!a || !(n>0)) return;
-    const errEl = $('sendErr');
+    const available = Number(last.bal || 0);
+    const feeMode = getSendFeeMode();
+    const feeIncluded = feeMode === 'included';
+    const recipientAmount = feeIncluded ? (n - SEND_FEE_IOC) : n;
+    const totalDebited = feeIncluded ? n : (n + SEND_FEE_IOC);
     if (!state.unlocked) {
       if (errEl) errEl.textContent = 'Unlock wallet to send';
       const sheet = $('sendModal')?.querySelector('.sheet');
       if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
       return;
     }
+    if (feeIncluded && recipientAmount <= 0) {
+      if (errEl) errEl.textContent = `Amount must be greater than the ${SEND_FEE_IOC.toFixed(3)} IOC network fee`;
+      const sheet = $('sendModal')?.querySelector('.sheet');
+      if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
+      return;
+    }
+    if (available > 0 && totalDebited > available + SEND_ALL_EPSILON) {
+      if (errEl) {
+        errEl.textContent = feeIncluded
+          ? 'Amount exceeds available balance'
+          : `Insufficient funds. Total with fee: ${formatSendAmount(totalDebited)}`;
+      }
+      const sheet = $('sendModal')?.querySelector('.sheet');
+      if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
+      return;
+    }
     try {
-      await window.ioc.rpc('sendtoaddress', [a, n]);
+      const val = await window.ioc.tryRpc('validateaddress', [a]);
+      const isInvalid = !!(val && val.ok && val.result && typeof val.result === 'object' && val.result.isvalid === false);
+      if (isInvalid) {
+        if (errEl) errEl.textContent = 'Invalid recipient address';
+        const sheet = $('sendModal')?.querySelector('.sheet');
+        if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
+        return;
+      }
+    } catch (_) {
+      // If validation is unavailable, do not block send.
+    }
+    try {
+      const selectedRecipient = getSavedRecipients().find(r => r.id === sendModalSelectedRecipientId);
+      const confirmMsg =
+        `Please confirm the address is correct before sending.\n\n` +
+        `Recipient: ${selectedRecipient?.alias || 'Manual address'}\n` +
+        `Address: ${a}\n` +
+        `Recipient receives: ${formatSendAmount(recipientAmount)}\n` +
+        `Network fee: ${formatSendAmount(SEND_FEE_IOC)}\n` +
+        `Total debited: ${formatSendAmount(totalDebited)}`;
+      if (!window.confirm(confirmMsg)) return;
+      await window.ioc.rpc('sendtoaddress', [a, recipientAmount]);
       $('sendModal').classList.add('hidden');
       setTimeout(refresh, 400);
     } catch (e) {
-      const msg = extractRpcError(e) || 'Send failed';
+      const rawMsg = extractRpcError(e) || 'Send failed';
+      const msg = /insufficient funds/i.test(rawMsg) && !feeIncluded
+        ? `Insufficient funds. Total with fee: ${formatSendAmount(totalDebited)}`
+        : rawMsg;
       if (errEl) errEl.textContent = msg;
       const sheet = $('sendModal')?.querySelector('.sheet');
       if (sheet) { sheet.classList.remove('shake'); void sheet.offsetWidth; sheet.classList.add('shake'); }
@@ -1071,6 +2929,14 @@ function main() {
   });
 
   $('newAddrBtn').addEventListener('click', openNewAddrModal);
+  $('savedRecipientCreateBtn')?.addEventListener('click', () => {
+    setSavedRecipientFormOpen(true);
+    $('savedRecipientCancelBtn')?.classList.remove('hidden');
+    if ($('savedRecipientCancelBtn')) $('savedRecipientCancelBtn').textContent = 'Close';
+    $('savedRecipientAliasInput')?.focus();
+  });
+  $('savedRecipientSaveBtn')?.addEventListener('click', saveSavedRecipientFromForm);
+  $('savedRecipientCancelBtn')?.addEventListener('click', resetSavedRecipientForm);
   $('cancelNewAddr').addEventListener('click', () => $('newAddrModal').classList.add('hidden'));
   $('createNewAddr').addEventListener('click', createNewAddr);
   $('newLabel').addEventListener('keydown', e => { if (e.key === 'Enter') createNewAddr(); if (e.key === 'Escape') {$('newAddrModal').classList.add('hidden');}});
@@ -1085,6 +2951,11 @@ function main() {
       }
     });
   }
+
+  initWalletToolsActions();
+  initSettingsLiveDebug();
+  initCompactMode();
+  initHelpCenter();
 
   // Setup bootstrap handlers (skip/retry buttons)
   setupBootstrapHandlers();
@@ -1103,2305 +2974,457 @@ function main() {
     // Don't show connect banner - splash handles warmup display
     refresh();
   })();
+  window.addEventListener('resize', scheduleSplashStatusFit);
 }
-document.addEventListener('DOMContentLoaded', ()=>{ main(); try{ ensureHistoryLayout(); }catch(_){} loadVersion(); });
+document.addEventListener('DOMContentLoaded', () => { main(); loadVersion(); });
 
 // Load and display wallet version
 async function loadVersion() {
   try {
     const ver = await window.ioc.getVersion();
     const el = document.getElementById('walletVersion');
-    if (el) el.textContent = ver ? `v${ver}` : '—';
+    if (el) el.textContent = ver ? `v${ver}` : '-';
   } catch (_) {}
 }
 
-(function(){
-  if (document.getElementById("hist-cols-css")) return;
-  var css = `
-    /* History table column sizing */
-    #history-pane table{ table-layout:auto; width:100%; }
-    #history-pane th, #history-pane td{ white-space:nowrap; }
-    /* When column ~260px */
-    #history-pane .col-when{ width:260px; }
-    /* Amount column ~80px, right aligned */
-    #history-pane .col-amt{ width:80px; text-align:right; }
-    /* Address column uses the rest, no clipping/ellipsis */
-    #history-pane .col-addr{ white-space:nowrap; overflow:visible; }
-  `;
-  var el = document.createElement("style");
-  el.id = "hist-cols-css";
-  el.textContent = css;
-  document.head.appendChild(el);
-})();
-
-
-;(function(){
-  function q(id){return document.getElementById(id)}
-  async function rpc(m, a){ try { return await window.ioc.rpc(m, a||[]) } catch(e){ throw e } }
-
-  function setupWalletTools(){
-    var d=q('btnDump'), imp=q('btnImport'), op=q('btnOpenPath');
-    if (op && window.sys) op.addEventListener('click', function(){ window.sys.openFolder() });
-
-    if (d) d.addEventListener('click', async function(){
-      var pass = prompt('Enter wallet passphrase');
-      if (!pass) return;
-      var path = prompt('Enter full .txt path to save (e.g. /Users/you/Desktop/wallet_dump.txt)');
-      if (!path || !/\.txt$/i.test(path)) { alert('Path must end with .txt'); return; }
-      try {
-        await rpc('walletpassphrase',[pass,60]);
-        await rpc('dumpwalletRT',[path]);
-        alert('Dump complete to:\n'+path);
-      } catch(e){ alert('Dump failed'); }
-      try{ await rpc('walletlock',[]) }catch(e){}
-    });
-
-    if (imp) imp.addEventListener('click', async function(){
-      var pass = prompt('Enter wallet passphrase');
-      if (!pass) return;
-      var path = prompt('Enter full path of dump .txt to import');
-      if (!path || !/\.txt$/i.test(path)) { alert('Path must end with .txt'); return; }
-      try {
-        await rpc('walletpassphrase',[pass,120]);
-        await rpc('importwallet',[path]);
-        alert('Import started');
-      } catch(e){ alert('Import failed'); }
-      try{ await rpc('walletlock',[]) }catch(e){}
-    });
-  }
-
-  function setupLiveTail(){
-    var box=q('live-tail'), st=q('start-tail'), sp=q('stop-tail');
-    if (!box || !st || !sp || !window.diag) return;
-    window.diag.onData(function(line){
-      box.classList.remove('empty');
-      box.textContent += line;
-      box.scrollTop = box.scrollHeight;
-    });
-    st.addEventListener('click', function(){
-      box.classList.remove('empty');
-      box.textContent = '';
-      window.diag.startTail();
-    });
-    sp.addEventListener('click', function(){
-      window.diag.stopTail();
-      if (!box.textContent.trim()) box.classList.add('empty');
-    });
-  }
-
-  function init(){ setupWalletTools(); setupLiveTail(); }
-  if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', init); else init();
-})();
-
-/* IOC_WIDGET_TOOLS_MODAL_HOOK */
-function __ioc_modal(opts){
-  return new Promise(function(res){
-    var wrap=document.createElement('div');wrap.style.position='fixed';wrap.style.inset='0';wrap.style.background='rgba(0,0,0,.45)';wrap.style.display='flex';wrap.style.alignItems='center';wrap.style.justifyContent='center';wrap.style.zIndex='9999';
-    var box=document.createElement('div');box.style.background='#0B1A33';box.style.border='1px solid #1A3352';box.style.borderRadius='12px';box.style.padding='16px 18px';box.style.minWidth='340px';box.style.boxShadow='0 10px 30px rgba(0,0,0,.55)';
-    var h=document.createElement('div');h.textContent=opts&&opts.title?opts.title:'Input';h.style.color='#d9e5ea';h.style.fontWeight='600';h.style.margin='0 0 10px';h.style.textAlign='center';
-    var inp=document.createElement('input');inp.type=(opts&&opts.type)||'text';inp.placeholder=(opts&&opts.placeholder)||'';inp.value=(opts&&opts.value)||'';inp.style.width='100%';inp.style.padding='10px';inp.style.borderRadius='8px';inp.style.border='1px solid #1A3352';inp.style.background='#040C1A';inp.style.color='#d9e5ea';
-    var row=document.createElement('div');row.style.display='flex';row.style.gap='10px';row.style.marginTop='12px';row.style.justifyContent='center';
-    var ok=document.createElement('button');ok.textContent='OK';ok.className='btn';
-    var ca=document.createElement('button');ca.textContent='Cancel';ca.className='btn';
-    ok.onclick=function(){var v=inp.value;document.body.removeChild(wrap);res(v||null);};
-    ca.onclick=function(){document.body.removeChild(wrap);res(null);};
-    inp.addEventListener('keydown',function(e){if(e.key==='Enter')ok.click();if(e.key==='Escape')ca.click();});
-    row.appendChild(ok);row.appendChild(ca);box.appendChild(h);box.appendChild(inp);box.appendChild(row);wrap.appendChild(box);document.body.appendChild(wrap);setTimeout(function(){inp.focus();inp.select&&inp.select();},0);
-  });
-}
-function __ioc_defaultDumpPath(){
-  var d=new Date(),y=d.getFullYear(),m=('0'+(d.getMonth()+1)).slice(-2),da=('0'+d.getDate()).slice(-2);
-  return '/tmp/ioc-wallet-dump-'+y+m+da+'.txt';
-}
-async function __ioc_dump(){
-  try{
-    var pass=await __ioc_modal({title:'Enter wallet passphrase',type:'password',placeholder:'passphrase'}); if(!pass) return;
-    var path=await __ioc_modal({title:'Save dump as absolute path (.txt) — no ~',type:'text',value:__ioc_defaultDumpPath()}); if(!path) return;
-    if (/^~\//.test(path)) { alert('Use a full absolute path (no ~). Example: '+__ioc_defaultDumpPath()); return; }
-    try{ await window.ioc.rpc('walletpassphrase',[pass,300]); }catch(_){}
-    try{ await window.ioc.rpc('dumpwalletRT',[path]); }
-    catch(e1){
-      var msg=''+(e1&&e1.message?e1.message:e1);
-      if(/not.*found/i.test(msg)){ await window.ioc.rpc('dumpwallet',[path]); }
-      else { alert('Dump failed: '+msg); return; }
-    }
-    try{ await window.ioc.rpc('walletlock',[]); }catch(_){}
-    alert('Dump written to:\n'+path);
-  }catch(e){ alert('Dump failed'); }
-}
-async function __ioc_import(){
-  try{
-    var path=await __ioc_modal({title:'Absolute path to dump (.txt) — no ~',type:'text',placeholder:'/full/path/to/wallet-dump.txt'});
-    if(!path) return;
-    if (/^~\//.test(path)) { alert('Use a full absolute path (no ~)'); return; }
-    await window.ioc.rpc('importwallet',[path]);
-    alert('Import started:\n'+path);
-  }catch(e){ alert('Import failed'); }
-}
-document.addEventListener('DOMContentLoaded',function(){
-  var d=document.getElementById('btnDump'); if(d&&!d.__wired){ d.addEventListener('click',function(ev){ev.preventDefault();__ioc_dump();}); d.__wired=1; }
-  var i=document.getElementById('btnImport'); if(i&&!i.__wired){ i.addEventListener('click',function(ev){ev.preventDefault();__ioc_import();}); i.__wired=1; }
-});
-/* END_IOC_WIDGET_TOOLS_MODAL_HOOK */
-
-function __ensureHistoryScroller(){
-  const pane = document.querySelector('#history-pane');
-  if(!pane) return;
-  let scroller = pane.querySelector('.history-scroller');
-  if(!scroller){
-    const table = pane.querySelector('table');
-    if(!table) return;
-    scroller = document.createElement('div');
-    scroller.className = 'history-scroller';
-    const parent = table.parentNode;
-    parent.replaceChild(scroller, table);
-    scroller.appendChild(table);
-  }
-  const rect = pane.getBoundingClientRect();
-  const available = Math.max(260, window.innerHeight - rect.top - 160);
-  scroller.style.maxHeight = available + 'px';
-}
-window.addEventListener('resize', __ensureHistoryScroller);
-document.addEventListener('DOMContentLoaded', __ensureHistoryScroller);
-window.addEventListener('hashchange', __ensureHistoryScroller);
-new MutationObserver(__ensureHistoryScroller).observe(document.documentElement,{subtree:true,childList:true});
-
-(() => {
-  console.log("BACKUP button injector runs here");
-})();
-
-
-/* ===== Wallet Tools layout normalizer ===== */
-(() => {
-  const normalizeWalletTools = () => {
-    // Find the Wallet Tools button row
-    const tools =
-      document.querySelector('[data-panel="wallet-tools"]') ||
-      document.getElementById('wallet-tools') ||
-      Array.from(document.querySelectorAll('.panel,.card,.group,.section'))
-        .find(el => /wallet\s*tools/i.test(el.textContent || ''));
-
-    if (!tools) return false;
-
-    let row = tools.querySelector('.btn-row');
-    if (!row) {
-      row = tools.querySelector('div');
-    }
-    if (!row) return false;
-
-    // Row layout
-    row.style.display = 'flex';
-    row.style.flexWrap = 'wrap';
-    row.style.justifyContent = 'center';
-    row.style.gap = '16px';
-
-    // Normalize every button inside Wallet Tools
-    const btns = Array.from(row.querySelectorAll('button'));
-    btns.forEach(b => {
-      b.style.flex = '0 0 auto';   // don't stretch
-      b.style.width = 'auto';
-      b.style.minWidth = '';       // clear any minWidth left over
-      b.style.padding = '6px 16px';
-      b.style.margin = '0';
-      b.style.boxSizing = 'border-box';
-    });
-
-    // Ensure our BACKUP button specifically is not wider than others
-    const backup = document.getElementById('backupWalletBtn');
-    if (backup) {
-      backup.style.flex = '0 0 auto';
-      backup.style.width = 'auto';
-      backup.style.minWidth = '';
-      backup.style.padding = '6px 16px';
-    }
-
-    return true;
-  };
-
-  // Run now and also when Settings mounts
-  if (!normalizeWalletTools()) {
-    const mo = new MutationObserver(() => { if (normalizeWalletTools()) mo.disconnect(); });
-    mo.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(normalizeWalletTools, 500);
-    setTimeout(normalizeWalletTools, 1200);
-  }
-})();
-/// ===== end normalizer =====
-
-
-(function(){
-  if(window.__accentRuntimeInit)return; window.__accentRuntimeInit=true;
-
-  function ensureStyle(){
-    if(document.getElementById('accent-style')) return;
-    var css = `
-:root{--accent:#33A2DA}
-.btn,.btn.primary{background:var(--accent) !important;border-color:var(--accent) !important}
-.btn:hover{filter:brightness(1.05)}
-.tab.is-active,.tab.active{box-shadow:0 0 0 2px var(--accent) inset !important}
-.rule-accent,.accent{background:var(--accent) !important}
-#syncbar{background:var(--accent) !important}
-svg [data-accent="fill"]{fill:var(--accent) !important}
-svg [data-accent="stroke"]{stroke:var(--accent) !important}
-#accentPick{width:44px;height:32px;border:1px solid var(--border,#1A3352);border-radius:6px;background:#040C1A;padding:0}
-.accent-row{display:flex;gap:10px;align-items:center;margin-top:8px}
-.theme-card{margin-top:14px}
-.theme-card .card-title{font-weight:600;margin-bottom:8px}
-`;
-    var el = document.createElement('style'); el.id='accent-style'; el.textContent = css; document.head.appendChild(el);
-  }
-
-  function setAccent(c){
-    document.documentElement.style.setProperty('--accent', c);
-    try{ localStorage.setItem('accent', c) }catch(e){}
-  }
-  function getAccent(){
-    try{ return localStorage.getItem('accent') || '' }catch(e){ return '' }
-  }
-
-  function injectSettings(){
-    var tab = document.getElementById('tab-settings');
-    if(!tab || document.getElementById('accentPick')) return;
-
-    var card = document.createElement('div');
-    card.className = 'card theme-card';
-    card.innerHTML =
-      '<div class="card-title">Theme</div>' +
-      '<div class="accent-row">' +
-        '<input type="color" id="accentPick" value="#33A2DA">' +
-        '<button id="accentApply" class="btn">APPLY</button>' +
-        '<button id="accentReset" class="btn">RESET</button>' +
-      '</div>';
-
-    // Prefer placing after Wallet Tools; else append at end
-    var anchor = Array.from(tab.querySelectorAll('.card,.section')).find(x=>{
-      return /wallet\s*tools/i.test(x.textContent||'');
-    });
-    if(anchor && anchor.parentNode){
-      anchor.parentNode.insertBefore(card, anchor.nextSibling);
-    }else{
-      tab.appendChild(card);
-    }
-
-    var saved = getAccent();
-    if(saved){ setAccent(saved); var p=document.getElementById('accentPick'); if(p) p.value=saved; }
-
-    var a = document.getElementById('accentApply');
-    if(a){ a.addEventListener('click', function(){
-      var v = (document.getElementById('accentPick')||{}).value || '#33A2DA';
-      setAccent(v);
-    });}
-    var r = document.getElementById('accentReset');
-    if(r){ r.addEventListener('click', function(){
-      setAccent('#33A2DA');
-      var p=document.getElementById('accentPick'); if(p) p.value='#33A2DA';
-    });}
-  }
-
-  // Known teal colors that must be overridden to IOCoin blue
-  var TEAL_OVERRIDES = ['#20e0d0','#1fe0d0','#21dfd0','#20dfcf','#22e1d1','#2ae2d4','#14e1d0','#24e0d1','#23e0d1','#1fd6c1','#2da1dd','#00b3a0'];
-  var IOCOIN_BLUE = '#33A2DA';
-
-  function init(){
-    ensureStyle();
-    var saved = getAccent();
-    // ALWAYS force IOCoin blue on boot - no exceptions
-    // This ensures no stale teal can ever reappear from localStorage
-    setAccent(IOCOIN_BLUE);
-    // Update picker to match if it exists
-    var p = document.getElementById('accentPick');
-    if (p) p.value = IOCOIN_BLUE;
-  }
-
-  if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded', init, {once:true});
-  }else{
-    init();
-  }
-})();
-
-
-// === Global Accent Recolor (teal -> var(--accent)) ===
-(function(){
-  if (window.__accentGlobalRecolor) return; window.__accentGlobalRecolor = true;
-
-  // Old teal palette (hex & rgb variants) we want to override
-  const TEALS_HEX = new Set([
-    '#20e0d0','#1fe0d0','#21dfd0','#20dfcf','#22e1d1','#2ae2d4','#14e1d0',
-    '#24e0d1','#23e0d1'
-  ].map(s=>s.toLowerCase()));
-
-  // Parse "rgb(...)" or "rgba(...)" to [r,g,b,a]
-  function toRGBA(s){
-    if(!s) return null;
-    s = (''+s).trim().toLowerCase();
-    const m = s.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([0-9.]+))?\)$/i);
-    if(!m) return null;
-    return [parseInt(m[1]),parseInt(m[2]),parseInt(m[3]), m[4]==null?1:parseFloat(m[4])];
-  }
-  function rgbToHex([r,g,b]) {
-    return '#' + [r,g,b].map(x=>x.toString(16).padStart(2,'0')).join('');
-  }
-  // Is “roughly teal”? (tolerance for slight theme variations)
-  function approxTeal(r,g,b){
-    // target ~ (32,224,208)
-    const t = [32,224,208], tol = 20;
-    return Math.abs(r-t[0])<=tol && Math.abs(g-t[1])<=tol && Math.abs(b-t[2])<=tol;
-  }
-  function isTealColor(val) {
-    if(!val) return false;
-    let v = (''+val).trim().toLowerCase();
-    if (TEALS_HEX.has(v)) return true;
-    const rgba = toRGBA(v);
-    if (rgba){
-      const [r,g,b] = rgba;
-      if (approxTeal(r,g,b)) return true;
-      const hex = rgbToHex([r,g,b]);
-      if (TEALS_HEX.has(hex)) return true;
-    }
-    return false;
-  }
-
-  // Box-shadow can carry color strings; replace teal-like pieces
-  function normalizeShadow(sh){
-    if(!sh) return sh;
-    let v = (''+sh);
-    // Replace any rgb(a) teal-ish with var(--accent)
-    v = v.replace(/rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+(?:\s*,\s*[0-9.]+)?\s*\)/gi, (m)=>{
-      const rgba = toRGBA(m);
-      return (rgba && approxTeal(rgba[0],rgba[1],rgba[2])) ? 'var(--accent)' : m;
-    });
-    // Replace direct hex teals
-    TEALS_HEX.forEach(hex=>{
-      v = v.replace(new RegExp(hex,'gi'),'var(--accent)');
-    });
-    return v;
-  }
-
-  // Apply inline overrides to any element that uses teal
-  const COLOR_PROPS = [
-    'color','backgroundColor','borderTopColor','borderRightColor','borderBottomColor','borderLeftColor','outlineColor'
-  ];
-  function recolorElement(el){
-    try{
-      const cs = getComputedStyle(el);
-      let changed = false;
-
-      // Colors
-      COLOR_PROPS.forEach(prop=>{
-        const val = cs[prop];
-        if (isTealColor(val)) {
-          el.style[prop] = 'var(--accent)';
-          changed = true;
-        }
-      });
-
-      // Box shadow
-      if (cs.boxShadow && /rgb|#/.test(cs.boxShadow)) {
-        const replaced = normalizeShadow(cs.boxShadow);
-        if (replaced !== cs.boxShadow) {
-          el.style.boxShadow = replaced;
-          changed = true;
-        }
-      }
-
-      // SVG: map teal fills/strokes to currentColor, then set color to var(--accent)
-      if (el.tagName === 'SVG' || el.querySelector && el.querySelector('svg')){
-        const svgs = el.tagName==='SVG' ? [el] : el.querySelectorAll('svg');
-        svgs.forEach(svg=>{
-          svg.querySelectorAll('*').forEach(n=>{
-            const gs = getComputedStyle(n);
-            const f = gs.fill, st = gs.stroke;
-            if (isTealColor(f)) { n.style.fill = 'currentColor'; svg.style.color='var(--accent)'; changed=true; }
-            if (isTealColor(st)) { n.style.stroke = 'currentColor'; svg.style.color='var(--accent)'; changed=true; }
-          });
-        });
-      }
-
-      return changed;
-    }catch(e){ return false; }
-  }
-
-  function walk(root){
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null);
-    let node = root.nodeType===1 ? root : walker.nextNode();
-    if(root.nodeType===1) recolorElement(root);
-    while(node = walker.nextNode()){
-      recolorElement(node);
-    }
-  }
-
-  function recolorAll(){ walk(document.body || document); }
-
-  // Observe future DOM changes so new nodes get the accent too
-  const mo = new MutationObserver((muts)=>{
-    for(const m of muts){
-      for(const n of m.addedNodes){
-        if (n.nodeType===1) walk(n);
-      }
-    }
-  });
-
-  if (document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded', ()=>{
-      recolorAll();
-      try{ mo.observe(document.body, {childList:true, subtree:true}); }catch(e){}
-    }, {once:true});
-  } else {
-    recolorAll();
-    try{ mo.observe(document.body, {childList:true, subtree:true}); }catch(e){}
-  }
-})();
-
-
-
-
-
-/* ===== BACKUP button injector (clean, single handler, no status text) ===== */
-(()=>{ if(window.__IOC_BACKUP_ONE) return; window.__IOC_BACKUP_ONE = true;
-  const getInvoke = () => (
-    (window.electron && window.electron.ipcRenderer && window.electron.ipcRenderer.invoke) ? window.electron.ipcRenderer.invoke.bind(window.electron.ipcRenderer)
-    : (window.api && window.api.invoke) ? window.api.invoke.bind(window.api)
-    : null
-  );
-  function install(){
-    const panel = document.querySelector('[data-panel="wallet-tools"]') || document;
-    const btns  = Array.from(panel.querySelectorAll('button,.btn'));
-    const open  = btns.find(b => ((b.textContent||'').trim().toUpperCase())==='IOC FOLDER')
-               || btns.find(b => /OPEN DEFAULT PATH/i.test(b.textContent||''));
-    if(!open) return false;
-
-    let bak = document.getElementById('backupWalletBtn');
-    if(!bak){
-      bak = document.createElement('button');
-      bak.id = 'backupWalletBtn';
-      bak.className = open.className || 'btn';
-      bak.textContent = 'BACKUP';
-      open.parentElement && open.parentElement.insertBefore(bak, open.nextSibling);
-    }
-    if(bak.__wired) return true;
-    bak.__wired = true;
-    bak.addEventListener('click', async (e)=>{
-      e.preventDefault();
-      const invoke = getInvoke(); if(!invoke) return;
-      bak.disabled = true;
-      try { await invoke('ioc:wallet:backup'); } finally { bak.disabled = false; }
-    }, true);
-    return true;
-  }
-  if(!install()){
-    const mo = new MutationObserver(()=>{ if(install()) mo.disconnect(); });
-    mo.observe(document.documentElement, {childList:true, subtree:true});
-  }
-})();
-/// ===== end injector =====
-
-
-
-// /* HISTORY_AMT_ALIGN */
-document.addEventListener('DOMContentLoaded', function(){
-  try{
-    var s=document.createElement('style');
-    s.textContent = '.tx-amt{text-align:right;min-width:64px;padding-right:8px;} .tx-when{padding-right:10px;} .tx-addr{word-break:break-all;}';
-    document.head.appendChild(s);
-  }catch(_){}
-});
-
-
-/* --- History table layout (When | Amount | Address/Txid) --- */
-function ensureHistoryLayout(){
-  try{
-    const tbody = document.getElementById('txrows'); if(!tbody) return;
-    const table = tbody.closest('table'); if(!table) return;
-
-    // Inject styles once
-    if(!document.getElementById('hist-col-style')){
-      const css = `
-        /* history table: fix column widths + right-align numbers + let addresses show fully */
-        #tab-history table col.when { width: 240px; }     /* Date/Time */
-        #tab-history table col.amt  { width: 90px; }      /* Amount   */
-        #tab-history td.num { text-align: right; padding-right: 12px; }
-        #tab-history td.addr {
-          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-          white-space: nowrap; overflow: visible; text-overflow: unset;
-        }
-      `;
-      const st = document.createElement('style');
-      st.id = 'hist-col-style'; st.textContent = css;
-      document.head.appendChild(st);
-    }
-
-    // Add a colgroup that locks the first two column widths; address flexes
-    if(!table.querySelector('colgroup')){
-      const cg = document.createElement('colgroup');
-      const c1 = document.createElement('col'); c1.className = 'when';
-      const c2 = document.createElement('col'); c2.className = 'amt';
-      const c3 = document.createElement('col'); // address/txid takes remaining width
-      cg.appendChild(c1); cg.appendChild(c2); cg.appendChild(c3);
-      table.insertBefore(cg, table.firstChild);
-    }
-  }catch(_){}
+function wireClickOnce(id, handler) {
+  const element = $(id);
+  if (!element || element.dataset.wiredClick === '1') return element;
+  element.dataset.wiredClick = '1';
+  element.addEventListener('click', handler);
+  return element;
 }
 
-// === History table (When / Amount / Address) ===
-async function loadHistory() {
+function isAbsoluteWalletPath(rawPath) {
+  const value = String(rawPath || '').trim();
+  if (!value) return false;
+  return /^[A-Za-z]:\\/.test(value) || /^\\\\/.test(value) || /^\//.test(value);
+}
+
+function formatDumpDateStamp(now = new Date()) {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}${m}${d}`;
+}
+
+function resolveDownloadsFolderFromDataDir(dataDir) {
+  const normalized = String(dataDir || '').replace(/\//g, '\\');
+  const userRoot = normalized.match(/^([A-Za-z]:\\Users\\[^\\]+)/i);
+  if (userRoot) return `${userRoot[1]}\\Downloads`;
+  return normalized || 'C:\\';
+}
+
+async function buildDefaultDumpPath() {
+  const suffix = `ioc-wallet-dump-${formatDumpDateStamp()}.txt`;
   try {
-    const rows = await window.ioc.listTx(50);
-    const tbody = document.getElementById('txrows');
-    if (!tbody) return;
-
-    tbody.innerHTML = '';
-
-    // Newest-first (sort by timereceived/time descending)
-    const sorted = (rows || []).slice().sort((a, b) => ((b.timereceived ?? b.time) || 0) - ((a.timereceived ?? a.time) || 0));
-    sorted.forEach(t => {
-      const tr = document.createElement('tr');
-      const d = new Date(((t.timereceived ?? t.time) || 0) * 1000);
-      const when = d.toLocaleDateString(undefined, {year:'numeric',month:'numeric',day:'numeric'}) + ' ' + d.toLocaleTimeString();
-      const amt  = Number(t.amount || 0);
-
-      const addr = (t.address || t.txid || '').toString();
-
-      const isPending = (t.confirmations === 0);
-      tr.innerHTML = `
-        <td class="c-when">${when}${isPending ? ' <span class="tx-pending">pending</span>' : ''}</td>
-        <td class="c-amt">${amt}</td>
-        <td class="c-addr" title="${addr}">${addr}</td>
-      `;
-      tbody.appendChild(tr);
-    });
-  } catch (_) {
-    // no-op; keep UI responsive even if daemon isn't ready
+    const dataDir = await window.ioc.getDataDir();
+    return `${resolveDownloadsFolderFromDataDir(dataDir)}\\${suffix}`;
+  } catch {
+    return `C:\\${suffix}`;
   }
 }
 
-// One-time CSS for history column widths/alignment
-(() => {
-  if (document.getElementById('history-cols-style')) return;
-  const css = `
-    #history-pane table { table-layout: fixed; width: 100%; }
-    #history-pane th, #history-pane td { padding: 10px 12px; }
-    /* column widths: When ~38%, Amount ~12%, Address gets the rest */
-    #history-pane thead th:nth-child(1),
-    #history-pane tbody td.c-when { width: 38%; text-align: left; }
-    #history-pane thead th:nth-child(2),
-    #history-pane tbody td.c-amt  { width: 12%; text-align: right; }
-    #history-pane thead th:nth-child(3),
-    #history-pane tbody td.c-addr { width: 50%; text-align: left; white-space: nowrap; overflow: visible; text-overflow: clip; }
-  `;
-  const el = document.createElement('style');
-  el.id = 'history-cols-style';
-  el.textContent = css;
-  document.head.appendChild(el);
-})();
-;(function(){
-  try{
-    if(document.getElementById('history-align-patch')) return;
-    const st = document.createElement('style');
-    st.id = 'history-align-patch';
-    st.textContent = `
-      section[data-panel="history"] table th,
-      section[data-panel="history"] table td{
-        text-align: left !important;
+function promptWithModal({ title, placeholder = '', type = 'text', value = '' }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal';
+
+    const sheet = document.createElement('div');
+    sheet.className = 'sheet';
+    sheet.style.width = 'min(480px, calc(100vw - 28px))';
+
+    const heading = document.createElement('div');
+    heading.className = 'title2';
+    heading.style.textAlign = 'center';
+    heading.textContent = title || 'Input';
+
+    const input = document.createElement('input');
+    input.type = type === 'password' ? 'password' : 'text';
+    input.placeholder = placeholder;
+    input.value = value;
+
+    const actions = document.createElement('div');
+    actions.className = 'row';
+    actions.style.justifyContent = 'center';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn';
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+
+    const okBtn = document.createElement('button');
+    okBtn.className = 'btn btn-ok';
+    okBtn.type = 'button';
+    okBtn.textContent = 'OK';
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      overlay.remove();
+      resolve(result);
+    };
+
+    cancelBtn.addEventListener('click', () => finish(null));
+    okBtn.addEventListener('click', () => finish(input.value || null));
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        okBtn.click();
+        return;
       }
-      /* Address / Txid is the 3rd column after removing Type */
-      section[data-panel="history"] table td:nth-child(3),
-      section[data-panel="history"] table th:nth-child(3){
-        text-align: left !important;
-        white-space: normal !important;
-        word-break: break-all !important;
-        overflow: visible !important;
-        text-overflow: clip !important;
-        max-width: none !important;
-      }
-    `;
-    document.addEventListener('DOMContentLoaded', ()=>document.head.appendChild(st));
-  }catch(_){}
-})();
-;(function(){
-  try{
-    if(document.getElementById('history-realalign-v2')) return;
-    const st = document.createElement('style');
-    st.id = 'history-realalign-v2';
-    st.textContent = `
-      /* Make the history table fill the panel and align left */
-      section[data-panel="history"] table{
-        width:100% !important;
-        table-layout:auto !important;
-        margin:0 !important;
-      }
-      /* Left-align everything and reduce heavy left padding */
-      section[data-panel="history"] table th,
-      section[data-panel="history"] table td{
-        text-align:left !important;
-        padding-left:12px !important;
-        padding-right:12px !important;
-        white-space:normal !important;
-        overflow:visible !important;
-        text-overflow:clip !important;
-        max-width:none !important;
-      }
-      /* Allocate widths: When ~260px, Amount ~80px, Address takes the rest */
-      section[data-panel="history"] table th:nth-child(1),
-      section[data-panel="history"] table td:nth-child(1){ width:260px !important; }
-      section[data-panel="history"] table th:nth-child(2),
-      section[data-panel="history"] table td:nth-child(2){ width:80px !important; }
-      section[data-panel="history"] table th:nth-child(3),
-      section[data-panel="history"] table td:nth-child(3){
-        width:auto !important;
-        white-space:normal !important;
-        word-break:break-all !important;   /* show full address/txid by wrapping */
-      }
-    `;
-    const mount = () => document.head.appendChild(st);
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', mount, { once:true });
-    } else { mount(); }
-  }catch(_){}
-})();
-/* history-force-left-v3: robust column control for History table */
-;(function(){
-  const ID = 'history-force-left-v3';
-  if (window[ID]) return; window[ID] = true;
-
-  function findHistoryTable(){
-    // Look for a heading that says "History", then grab the first table inside same card/container.
-    const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,.title,.card-title'));
-    const histHead = headings.find(h => /history/i.test(h.textContent || ''));
-    if(!histHead) return null;
-    // Walk up to the card/container
-    let card = histHead.closest('.card, section, div');
-    if(!card) card = histHead.parentElement;
-    if(!card) return null;
-    const tbl = card.querySelector('table');
-    return tbl || null;
-  }
-
-  function ensureColgroup(table){
-    // Remove any previous colgroup we added
-    const old = table.querySelector('colgroup[data-history-cols]');
-    if (old) old.remove();
-    const cg = document.createElement('colgroup');
-    cg.setAttribute('data-history-cols','');
-    // When ~260px, Amount ~80px, Address auto (fills remaining)
-    const cWhen = document.createElement('col');   cWhen.style.width = '260px';
-    const cAmt  = document.createElement('col');   cAmt.style.width  = '80px';
-    const cAddr = document.createElement('col');   cAddr.style.width = 'auto';
-    cg.append(cWhen, cAmt, cAddr);
-    table.prepend(cg);
-  }
-
-  function leftAlign(table){
-    table.style.width = '100%';
-    table.style.tableLayout = 'auto';
-    table.style.margin = '0';
-
-    const cells = table.querySelectorAll('th,td');
-    cells.forEach(el => {
-      el.style.textAlign   = 'left';
-      el.style.paddingLeft = '12px';
-      el.style.paddingRight= '12px';
-      el.style.whiteSpace  = 'normal';
-      el.style.overflow    = 'visible';
-      el.style.textOverflow= 'clip';
-      el.style.maxWidth    = 'none';
-      el.style.wordBreak   = 'break-all'; // long address/txid wraps
-    });
-  }
-
-  function normalizeHeaders(table){
-    const ths = Array.from(table.querySelectorAll('thead th'));
-    // If headers exist and still include a stray "Type", remove that column from DOM
-    const typeIdx = ths.findIndex(th => /type/i.test(th.textContent||''));
-    if (typeIdx >= 0){
-      // remove header + matching td in each row
-      ths[typeIdx].remove();
-      table.querySelectorAll('tbody tr').forEach(tr=>{
-        const tds = tr.querySelectorAll('td');
-        if (tds[typeIdx]) tds[typeIdx].remove();
-      });
-    }
-    // If headers are fewer than 3, we can't assign widths reliably
-    // but we still try to left-align.
-  }
-
-  function apply(){
-    const table = findHistoryTable();
-    if(!table) return;
-    normalizeHeaders(table);
-    ensureColgroup(table);
-    leftAlign(table);
-  }
-
-  const run = ()=>{ try{ apply(); }catch(e){} };
-
-  // Initial + DOM readiness
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run, { once:true });
-  } else { run(); }
-
-  // Keep it sticky across resizes, tab switches, or live updates
-  window.addEventListener('resize', run);
-  window.addEventListener('hashchange', run);
-  new MutationObserver(()=>run()).observe(document.documentElement, {subtree:true, childList:true});
-})();
-/* history-columns-v4: force 3-column History and remove "Type" */
-;(function(){
-  const ID='history-columns-v4';
-  if (window[ID]) return; window[ID]=true;
-
-  function findHistoryTable(){
-    // Prefer tables whose header cells contain When/Amount
-    const tables=[...document.querySelectorAll('table')];
-    for (const tbl of tables){
-      const ths=[...tbl.querySelectorAll('thead th')].map(th=>th.textContent.trim().toLowerCase());
-      if (ths.length && ths.some(t=>t.includes('when')) && ths.some(t=>t.includes('amount'))) {
-        return tbl;
-      }
-    }
-    // Fallback: heading "History" then first table under same card
-    const head=[...document.querySelectorAll('h1,h2,h3,h4,h5,.title,.card-title')].find(h=>/history/i.test(h.textContent||''));
-    if(head){
-      const card=head.closest('.card, section, div')||head.parentElement;
-      if(card){ const t=card.querySelector('table'); if(t) return t; }
-    }
-    return null;
-  }
-
-  function removeTypeColumn(table){
-    const ths=[...table.querySelectorAll('thead th')];
-    const idx=ths.findIndex(th=>/^\s*type\s*$/i.test(th.textContent||''));
-    if(idx>=0){
-      ths[idx].remove();
-      table.querySelectorAll('tbody tr').forEach(tr=>{
-        const cells=tr.querySelectorAll('td');
-        if(cells[idx]) cells[idx].remove();
-      });
-    }
-  }
-
-  function installStyleOnce(){
-    if(document.getElementById('history-columns-v4-style')) return;
-    const css=`
-      /* Force layout & left alignment, show full address (wrap if needed) */
-      table[data-history-forced]{
-        table-layout:fixed !important;
-        width:100% !important;
-        border-collapse:separate !important;
-      }
-      table[data-history-forced] thead th,
-      table[data-history-forced] tbody td{
-        text-align:left !important;
-        padding-left:12px !important;
-        padding-right:12px !important;
-        white-space:normal !important;
-        overflow:visible !important;
-        text-overflow:clip !important;
-        max-width:none !important;
-        word-break:break-all !important; /* ensures long base58 wraps */
-      }
-      /* Column widths: When ~260px, Amount ~80px (right-aligned), Address fills */
-      table[data-history-forced] thead th:nth-child(1),
-      table[data-history-forced] tbody td:nth-child(1){
-        width:260px !important; white-space:nowrap !important;
-      }
-      table[data-history-forced] thead th:nth-child(2),
-      table[data-history-forced] tbody td:nth-child(2){
-        width:80px !important; text-align:right !important; white-space:nowrap !important;
-      }
-      table[data-history-forced] thead th:nth-child(3),
-      table[data-history-forced] tbody td:nth-child(3){
-        width:auto !important;
-      }
-      /* Kill common truncation classes if present */
-      table[data-history-forced] .truncate,
-      table[data-history-forced] .ellipsis{
-        overflow:visible !important; text-overflow:clip !important; white-space:normal !important; max-width:none !important;
-      }
-    `.replace(/\s+/g,' ');
-    const style=document.createElement('style');
-    style.id='history-columns-v4-style';
-    style.textContent=css;
-    document.head.appendChild(style);
-  }
-
-  function apply(){
-    installStyleOnce();
-    const tbl=findHistoryTable();
-    if(!tbl) return;
-    removeTypeColumn(tbl);
-    // Mark and enforce 3 columns by ensuring exactly 3 header cells
-    tbl.setAttribute('data-history-forced','1');
-
-    // If headers aren’t exactly 3 (e.g., extra blank th), trim to 3
-    const ths=[...tbl.querySelectorAll('thead th')];
-    if (ths.length>3){
-      // keep When, Amount, Address columns by position heuristics:
-      // Find the first th that matches /when/i, first matching /amount/i, and last one for address
-      const when = ths.find(th=>/when/i.test(th.textContent||'')) || ths[0];
-      const amt  = ths.find(th=>/amount/i.test(th.textContent||'')) || ths[1] || ths[0];
-      const addr = ths.find(th=>/addr|tx/i.test(th.textContent||'')) || ths[2] || ths[ths.length-1];
-      const keep=[when,amt,addr];
-      ths.forEach(th=>{ if(!keep.includes(th)) th.remove(); });
-      // remove matching body cells by index gaps
-      const idxs = keep.map(k=>[...k.parentElement.children].indexOf(k));
-      tbl.querySelectorAll('tbody tr').forEach(tr=>{
-        const tds=[...tr.children];
-        tds.forEach((td,i)=>{ if(!idxs.includes(i)) td.remove(); });
-      });
-    }
-  }
-
-  const run=()=>{ try{ apply(); }catch(_){} };
-  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', run, {once:true}); } else { run(); }
-  window.addEventListener('hashchange', run);
-  window.addEventListener('resize', run);
-  new MutationObserver(()=>run()).observe(document.documentElement,{subtree:true, childList:true});
-})();
-
-// --- begin: enforced History column layout (id=history-columns) ---
-(function historyColumnsInstaller(){
-  function ensureHistoryColumns(){
-    try{
-      // remove older injections if any
-      for (const id of ['history-columns','amount-left-tight']) {
-        const old = document.getElementById(id); if (old) old.remove();
-      }
-      const s = document.createElement('style');
-      s.id = 'history-columns';
-      s.textContent = `
-        /* Lock table width rules for History only */
-        #history table, .history table { table-layout: fixed !important; width: 100% !important; }
-
-        /* Normalize cell padding */
-        #history table th, #history table td,
-        .history table th, .history table td { padding: 6px 8px !important; }
-
-        /* Column 1: When (fit the timestamp, left aligned) */
-        #history table th:nth-child(1), #history table td:nth-child(1),
-        .history table th:nth-child(1), .history table td:nth-child(1) {
-          width: 200px !important; min-width: 200px !important; max-width: 220px !important;
-          text-align: left !important;
-        }
-
-        /* Column 2: Amount (make very narrow, left aligned) */
-        #history table th:nth-child(2), #history table td:nth-child(2),
-        .history table th:nth-child(2), .history table td:nth-child(2) {
-          width: 56px !important; min-width: 48px !important; max-width: 64px !important;
-          text-align: left !important; padding-left: 4px !important; padding-right: 4px !important;
-        }
-
-        /* Column 3: Address / Txid (take everything else, wrap nicely) */
-        #history table th:nth-child(3), #history table td:nth-child(3),
-        .history table th:nth-child(3), .history table td:nth-child(3) {
-          width: calc(100% - 256px) !important;   /* 200 (when) + ~56 (amount) */
-          white-space: normal !important;          /* allow multi-line */
-          word-break: break-word !important;       /* wrap long strings */
-          overflow: visible !important;
-          text-align: left !important;
-        }
-      `;
-      document.head.appendChild(s);
-    }catch(e){ console.warn('History column styler skipped:', e); }
-  }
-  document.addEventListener('DOMContentLoaded', ensureHistoryColumns);
-  window.addEventListener('hashchange', ensureHistoryColumns);
-  // In case History is already rendered
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    requestAnimationFrame(ensureHistoryColumns);
-  }
-})();
-// --- end: enforced History column layout ---
-
-// ===== History table colgroup enforcer (id: hist-colgroup-enforcer) =====
-(function installHistColgroupEnforcer(){
-  const ID = 'hist-colgroup-enforcer';
-  if (window[ID]) return; // avoid double-install
-  window[ID] = true;
-
-  function headerText(th){ return (th?.textContent || '').trim().toLowerCase(); }
-  function looksLikeHistoryTable(tbl){
-    const ths = tbl.querySelectorAll('thead th');
-    if (!ths.length) return false;
-    let names = Array.from(ths).map(headerText);
-    // accept "address" or "address / txid" style headers
-    const hasWhen   = names.some(t => t.startsWith('when'));
-    const hasAmount = names.some(t => t.startsWith('amount'));
-    const hasAddr   = names.some(t => t.startsWith('address'));
-    return hasWhen && hasAmount && hasAddr;
-  }
-
-  function applyColgroup(tbl){
-    if (!tbl || tbl.__histColsApplied) return;
-
-    // Ensure table layout is fixed so col widths are respected
-    tbl.style.tableLayout = 'fixed';
-    tbl.style.width = '100%';
-
-    // Remove any previous colgroup we added
-    const old = tbl.querySelector('colgroup[data-hist="1"]');
-    if (old) old.remove();
-
-    const cg = document.createElement('colgroup');
-    cg.setAttribute('data-hist','1');
-
-    const cWhen   = document.createElement('col');
-    const cAmount = document.createElement('col');
-    const cAddr   = document.createElement('col');
-
-    cWhen.style.width   = '200px';
-    cWhen.style.minWidth= '200px';
-    cAmount.style.width = '64px';
-    cAmount.style.minWidth = '56px';
-    cAddr.style.width   = 'auto';
-
-    cg.append(cWhen, cAmount, cAddr);
-    tbl.insertBefore(cg, tbl.firstChild);
-
-    // Force left align on amount, wrap address
-    const rows = tbl.querySelectorAll('tbody tr');
-    rows.forEach(tr=>{
-      const tds = tr.children;
-      if (tds[1]) {
-        tds[1].style.textAlign = 'left';
-        tds[1].style.paddingLeft = '4px';
-        tds[1].style.paddingRight= '4px';
-      }
-      if (tds[2]) {
-        Object.assign(tds[2].style, {
-          whiteSpace: 'normal',
-          wordBreak: 'break-word',
-          overflow: 'visible',
-          textAlign: 'left'
-        });
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        cancelBtn.click();
       }
     });
-
-    // Header alignment to match
-    const ths = tbl.querySelectorAll('thead th');
-    if (ths[1]) ths[1].style.textAlign = 'left';
-    if (ths[2]) ths[2].style.textAlign = 'left';
-
-    tbl.__histColsApplied = true;
-  }
-
-  function scan(){
-    document.querySelectorAll('table').forEach(tbl=>{
-      if (looksLikeHistoryTable(tbl)) applyColgroup(tbl);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) finish(null);
     });
-  }
 
-  // Run now & on view changes/renders
-  const kickoff = ()=> requestAnimationFrame(scan);
-  document.addEventListener('DOMContentLoaded', kickoff);
-  window.addEventListener('hashchange', kickoff);
-  new MutationObserver(() => { scan(); }).observe(document.documentElement, {subtree:true, childList:true});
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    sheet.appendChild(heading);
+    sheet.appendChild(input);
+    sheet.appendChild(actions);
+    overlay.appendChild(sheet);
+    document.body.appendChild(overlay);
 
-  // If already interactive, apply once immediately
-  if (document.readyState !== 'loading') kickoff();
-})();
- // ===== end history colgroup enforcer =====
-
-(function(){
-  if(document.getElementById("history-col-tune")) return;
-  const s=document.createElement("style");
-  s.id="history-col-tune";
-  s.textContent=`
-    .history-table th, .history-table td { vertical-align: middle; }
-    .history-table .col-amount { width:44px; text-align:left; }
-    .history-table td.col-amount, .history-table th.col-amount { text-align:left; }
-    .history-table .col-address { min-width:420px; }
-  `;
-  document.addEventListener("DOMContentLoaded",()=>document.head.appendChild(s));
-})();
-
-// __HIST_COL_FIX__: keep history columns readable without touching daemon/render logic.
-(() => {
-  const css = `
-    /* Scope to the History view only */
-    #history table { table-layout: fixed; width: 100%; }
-
-    /* Amount column (2nd): narrower and left-aligned */
-    #history table thead th:nth-child(2),
-    #history table tbody td:nth-child(2) {
-      width: 76px;         /* compact */
-      padding-left: 8px;   /* nudge left */
-      text-align: left;    /* no right centering */
-      white-space: nowrap;
-    }
-
-    /* Address / Txid column (3rd): use the rest, avoid wrapping */
-    #history table thead th:nth-child(3),
-    #history table tbody td:nth-child(3) {
-      padding-left: 14px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-  `.trim();
-
-  const style = document.createElement('style');
-  style.setAttribute('data-tag', '__HIST_COL_FIX__');
-  style.textContent = css;
-  document.addEventListener('DOMContentLoaded', () => {
-    document.head.appendChild(style);
+    setTimeout(() => {
+      input.focus();
+      if (type !== 'password') input.select();
+    }, 0);
   });
-})();
+}
 
-// __HIST_FONT_FIX__: adjust font size + column widths for History table
-(() => {
-  const css = `
-    #history table {
-      table-layout: fixed;
-      width: 100%;
-      font-size: 12px; /* smaller font */
-    }
-    /* Amount column */
-    #history table thead th:nth-child(2),
-    #history table tbody td:nth-child(2) {
-      width: 76px;
-      padding-left: 8px;
-      text-align: left;
-      white-space: nowrap;
-    }
-    /* Address / Txid column */
-    #history table thead th:nth-child(3),
-    #history table tbody td:nth-child(3) {
-      padding-left: 14px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-  `.trim();
-
-  const style = document.createElement('style');
-  style.setAttribute('data-tag', '__HIST_FONT_FIX__');
-  style.textContent = css;
-  document.addEventListener('DOMContentLoaded', () => {
-    document.head.appendChild(style);
+async function dumpWalletToFile() {
+  const passphrase = await promptWithModal({
+    title: 'Enter wallet passphrase',
+    placeholder: 'Wallet passphrase',
+    type: 'password'
   });
-})();
-;(function(){
-  if (window['topbar-static-v1']) return; window['topbar-static-v1']=true;
+  if (!passphrase) return;
 
-  function pickHeader(){
-    return document.querySelector('header,[role="banner"],.topbar,.navbar,.app-header,.header');
-  }
-  function pickMain(hdr){
-    if (!hdr) return null;
-    const p = hdr.parentElement;
-    const next = hdr.nextElementSibling;
-    if (next) return next;
-    if (p && p.children.length>1) return p.children[1];
-    return document.querySelector('main,.main,.content,#content,.app-content') || p;
-  }
-  function apply(){
-    const hdr = pickHeader(); if(!hdr) return;
-    const main = pickMain(hdr); if(!main) return;
+  const defaultPath = await buildDefaultDumpPath();
+  const pathInput = await promptWithModal({
+    title: 'Absolute destination path (.txt)',
+    placeholder: 'C:\\Users\\<user>\\Downloads\\ioc-wallet-dump-YYYYMMDD.txt',
+    value: defaultPath
+  });
+  if (!pathInput) return;
 
-    hdr.style.position = 'sticky';
-    hdr.style.top = '0';
-    hdr.style.zIndex = '1000';
-    if (!getComputedStyle(hdr).backgroundColor || getComputedStyle(hdr).backgroundColor==='rgba(0, 0, 0, 0)'){
-      hdr.style.background = 'var(--bg, #040C1A)';
-    }
-
-    const h = Math.ceil(hdr.getBoundingClientRect().height) || 64;
-    const vh = window.innerHeight || document.documentElement.clientHeight || 800;
-    const targetH = Math.max(200, vh - h) + 'px';
-
-    main.style.height = targetH;
-    main.style.maxHeight = targetH;
-    main.style.overflowY = 'auto';
-    main.style.overflowX = 'hidden';
-
-    document.querySelectorAll('section[data-panel], .tab-panel, .pane, .card-body').forEach(el=>{
-      if (el === hdr) return;
-      if (el.closest('header,[role="banner"],.topbar,.navbar,.app-header,.header')) return;
-      el.style.overflowY = el.style.overflowY || 'auto';
-      el.style.maxHeight = el.style.maxHeight || '100%';
-    });
+  const targetPath = String(pathInput).trim();
+  if (!isAbsoluteWalletPath(targetPath)) {
+    alert('Use an absolute path. Example: C:\\Users\\<user>\\Downloads\\ioc-wallet-dump-YYYYMMDD.txt');
+    return;
   }
 
-  const run = ()=>{ try{ apply(); }catch(e){} };
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run, { once:true });
-  } else {
-    run();
-  }
-  window.addEventListener('resize', run);
-  window.addEventListener('hashchange', run);
-  new MutationObserver(()=>run()).observe(document.documentElement,{subtree:true,childList:true});
-})();
-// FIXED_TOP_SCROLL_V2
-(function(){
-  const ID='fixed-top-scroll-v2'; if (window[ID]) return; window[ID]=true;
-
-  // Inject high-specificity CSS once
-  if (!document.getElementById('fixed-top-scroll-style')) {
-    const st = document.createElement('style'); st.id='fixed-top-scroll-style';
-    st.textContent = `
-      html, body { height:100% !important; overflow:hidden !important; }
-      header, [role="banner"], .topbar, .navbar, .app-header, .header {
-        position: sticky !important; top: 0 !important; z-index: 1000 !important;
-        /* ensure the bar paints over content */
-        background: var(--hdr-bg, rgba(0,0,0,0.8)) !important;
-        backdrop-filter: saturate(120%) blur(0.5px);
-      }
-      /* Only the chosen region scrolls */
-      .__ioc_scroll_region__ {
-        overflow-y: auto !important;
-        overflow-x: hidden !important;
-        -webkit-overflow-scrolling: touch !important;
-        height: calc(100vh - var(--hdrH, 64px)) !important;
-        max-height: calc(100vh - var(--hdrH, 64px)) !important;
-      }
-      /* Prevent nested panes from introducing second scrollbars */
-      .__ioc_scroll_region__ .pane, 
-      .__ioc_scroll_region__ .tab-panel,
-      .__ioc_scroll_region__ .card-body {
-        overscroll-behavior: contain;
-        max-height: none !important;
-        overflow: visible !important;
-      }
-    `;
-    document.head.appendChild(st);
-  }
-
-  function pickHeader(){
-    return document.querySelector('header,[role="banner"],.topbar,.navbar,.app-header,.header');
-  }
-
-  function pickScrollRegion(hdr){
-    if (!hdr) return null;
-    // Prefer the immediate sibling after header
-    let cand = hdr.nextElementSibling;
-    // Fallbacks if layout nests content deeper
-    const fbs = [
-      cand,
-      document.querySelector('main'),
-      document.querySelector('#content'),
-      document.querySelector('.content'),
-      document.querySelector('.app-content'),
-      document.querySelector('.container'),
-      document.querySelector('section[data-panel]')?.parentElement
-    ].filter(Boolean);
-    // Choose the first element that is not the header and is displayed
-    return fbs.find(el => el && el !== hdr && getComputedStyle(el).display !== 'none') || null;
-  }
-
-  function apply(){
-    const hdr = pickHeader(); if (!hdr) return;
-    const H = Math.ceil(hdr.getBoundingClientRect().height) || 64;
-    document.documentElement.style.setProperty('--hdrH', H + 'px');
-    // Ensure header paints solid background (avoid transparency over content)
-    const bg = getComputedStyle(hdr).backgroundColor;
-    if (!bg || bg === 'rgba(0, 0, 0, 0)') {
-      hdr.style.setProperty('--hdr-bg', '#040C1A');
-    }
-
-    const region = pickScrollRegion(hdr);
-    if (!region) return;
-
-    // Make ONLY this region scroll
-    region.classList.add('__ioc_scroll_region__');
-
-    // Ensure ancestors don’t re-enable scrolling on body
-    document.body.style.overflow = 'hidden';
-
-    // Remove overflow from nested containers that might fight our rule
-    region.querySelectorAll('[style*="overflow"]').forEach(el=>{
-      // Keep explicit component behaviors; just avoid global y-scrolls on wrappers
-      if (/(auto|scroll)/i.test(el.style.overflowY)) {
-        el.style.overflowY = '';
-      }
-    });
-  }
-
-  const run = () => { try { apply(); } catch {} };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run, { once: true });
-  } else {
-    run();
-  }
-  window.addEventListener('resize', run);
-  window.addEventListener('hashchange', run);
-  new MutationObserver(run).observe(document.documentElement, { childList: true, subtree: true });
-})();
-// FIXED_PANES_SCROLL_V3
-(function(){
-  const ID='FIXED_PANES_SCROLL_V3'; if (window[ID]) return; window[ID]=true;
-
-  // High-specificity CSS: fixed header; content root fills viewport minus header; panes scroll inside.
-  function injectCSS(){
-    if (document.getElementById('fixed-panes-style')) return;
-    const st = document.createElement('style'); st.id='fixed-panes-style';
-    st.textContent = `
-      /* Header stays fixed */
-      header, [role="banner"], .topbar, .navbar, .app-header, .header {
-        position: sticky !important;
-        top: 0 !important;
-        z-index: 1000 !important;
-        background: var(--hdr-bg, rgba(0,0,0,0.85)) !important;
-      }
-      /* Root content area under header: owns layout height; not scrollable itself */
-      .__ioc-content {
-        position: relative !important;
-        height: calc(100vh - var(--hdrH, 64px)) !important;
-        max-height: calc(100vh - var(--hdrH, 64px)) !important;
-        overflow: hidden !important;
-      }
-      /* Each pane (Overview/History/Settings): fills content area and scrolls */
-      .__ioc-content > section[data-panel],
-      .__ioc-content > .tab-panel,
-      .__ioc-content > .pane,
-      .__ioc-content > .card-body,
-      .__ioc-pane {
-        height: 100% !important;
-        max-height: 100% !important;
-        overflow-y: auto !important;
-        overflow-x: hidden !important;
-        -webkit-overflow-scrolling: touch !important;
-        overscroll-behavior: contain !important;
-      }
-      /* Prevent nested containers from re-introducing page scrollbars */
-      html, body {
-        height: 100% !important;
-        overflow: hidden !important;
-      }
-    `;
-    document.head.appendChild(st);
-  }
-
-  function pickHeader(){
-    return document.querySelector('header,[role="banner"],.topbar,.navbar,.app-header,.header');
-  }
-
-  function pickContentRoot(hdr){
-    if (!hdr) return null;
-    // Prefer the immediate sibling under the header
-    let root = hdr.nextElementSibling;
-    // Robust fallbacks if layout differs
-    if (!root || getComputedStyle(root).display === 'none') {
-      root = document.querySelector('main,#content,.content,.app-content,.container,.page,.body');
-    }
-    // As a last resort, try the header's parent (minus header)
-    if (!root && hdr.parentElement && hdr.parentElement.children.length > 1) {
-      root = hdr.parentElement.children[1];
-    }
-    return root || null;
-  }
-
-  function tagPanes(root){
-    // Mark the root
-    root.classList.add('__ioc-content');
-
-    // Ensure direct panes are scrollable
-    const directPanes = root.querySelectorAll(':scope > section[data-panel], :scope > .tab-panel, :scope > .pane, :scope > .card-body');
-    if (directPanes.length) {
-      directPanes.forEach(el => el.classList.add('__ioc-pane'));
-    } else {
-      // If panes are nested one level deeper (common), tag them too
-      const nested = root.querySelectorAll('section[data-panel], .tab-panel, .pane, .card-body');
-      nested.forEach(el => el.classList.add('__ioc-pane'));
-    }
-  }
-
-  function apply(){
-    injectCSS();
-
-    const hdr = pickHeader();
-    if (!hdr) return;
-
-    // Measure header height and expose it as CSS var
-    const H = Math.max(48, Math.ceil(hdr.getBoundingClientRect().height) || 64);
-    document.documentElement.style.setProperty('--hdrH', H + 'px');
-
-    // Ensure header has a solid background behind it
-    const bg = getComputedStyle(hdr).backgroundColor;
-    if (!bg || bg === 'rgba(0, 0, 0, 0)') {
-      hdr.style.setProperty('--hdr-bg', '#040C1A');
-    }
-
-    const root = pickContentRoot(hdr);
-    if (!root) return;
-
-    tagPanes(root);
-  }
-
-  const run = () => { try { apply(); } catch(e){} };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run, { once: true });
-  } else {
-    run();
-  }
-  window.addEventListener('resize', run);
-  window.addEventListener('hashchange', run);
-  new MutationObserver(run).observe(document.documentElement, { childList: true, subtree: true });
-})();
-// IOC_SCROLL_WRAPPER_V1
-(function(){
-  const KEY='IOC_SCROLL_WRAPPER_V1'; if (window[KEY]) return; window[KEY]=true;
-
-  function getHeader(){
-    return document.querySelector('header,[role="banner"],.topbar,.navbar,.app-header,.header');
-  }
-
-  function makeStickyHeader(hdr){
-    hdr.style.position = 'sticky';
-    hdr.style.top = '0';
-    hdr.style.zIndex = '1000';
-    // ensure it paints (avoid transparent overlap)
-    const bg = getComputedStyle(hdr).backgroundColor;
-    if (!bg || bg === 'rgba(0, 0, 0, 0)') hdr.style.background = '#040C1A';
-  }
-
-  function ensureScrollContainer(hdr){
-    let sc = document.getElementById('ioc-scroll-container');
-    if (!sc){
-      sc = document.createElement('div');
-      sc.id = 'ioc-scroll-container';
-      sc.style.overflowY = 'auto';
-      sc.style.overflowX = 'hidden';
-      sc.style.webkitOverflowScrolling = 'touch';
-      sc.style.position = 'relative';
-
-      const parent = hdr.parentNode;
-      // insert right after header
-      if (hdr.nextSibling) parent.insertBefore(sc, hdr.nextSibling);
-      else parent.appendChild(sc);
-
-      // move all nodes after header into the scroll container
-      let n = sc.nextSibling; // after inserting, sc is after header
-      while (n){
-        const next = n.nextSibling;
-        sc.appendChild(n);
-        n = next;
-      }
-    }
-    return sc;
-  }
-
-  function resize(sc, hdr){
-    const H = Math.ceil(hdr.getBoundingClientRect().height) || 64;
-    sc.style.height = `calc(100vh - ${H}px)`;
-    sc.style.maxHeight = `calc(100vh - ${H}px)`;
-  }
-
-  function apply(){
-    const hdr = getHeader();
-    if (!hdr) return;
-    makeStickyHeader(hdr);
-    const sc = ensureScrollContainer(hdr);
-    resize(sc, hdr);
-
-    // lock page scroll; only container scrolls
-    document.documentElement.style.height = '100%';
-    document.body.style.height = '100%';
-    document.documentElement.style.overflow = 'hidden';
-    document.body.style.overflow = 'hidden';
-  }
-
-  const run = ()=>{ try{ apply(); }catch(e){} };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run, { once:true });
-  } else {
-    run();
-  }
-  window.addEventListener('resize', run);
-  window.addEventListener('hashchange', run);
-  new MutationObserver(run).observe(document.documentElement, {subtree:true, childList:true});
-})();
-// IOC_SCROLL_TABS_V1
-(function(){
-  const KEY='IOC_SCROLL_TABS_V1'; if (window[KEY]) return; window[KEY]=true;
-
-  const targetTabs = ['history', 'address', 'settings'];
-
-  function getHeader(){
-    return document.querySelector('header,[role="banner"],.topbar,.navbar,.app-header,.header');
-  }
-
-  function makeStickyHeader(hdr){
-    hdr.style.position = 'sticky';
-    hdr.style.top = '0';
-    hdr.style.zIndex = '1000';
-    const bg = getComputedStyle(hdr).backgroundColor;
-    if (!bg || bg === 'rgba(0, 0, 0, 0)') hdr.style.background = '#040C1A';
-  }
-
-  function ensureScrollContainer(pane){
-    let sc = pane.querySelector('.ioc-scroll-container');
-    if (!sc){
-      sc = document.createElement('div');
-      sc.className = 'ioc-scroll-container';
-      sc.style.overflowY = 'auto';
-      sc.style.overflowX = 'hidden';
-      sc.style.webkitOverflowScrolling = 'touch';
-      sc.style.position = 'relative';
-      sc.style.height = '100%';
-      sc.style.maxHeight = '100%';
-
-      while (pane.firstChild) {
-        sc.appendChild(pane.firstChild);
-      }
-      pane.appendChild(sc);
-    }
-    return sc;
-  }
-
-  function resizeScroll(pane){
-    const hdr = getHeader();
-    if (!hdr) return;
-    const sc = ensureScrollContainer(pane);
-    const H = Math.ceil(hdr.getBoundingClientRect().height) || 64;
-    sc.style.height = `calc(100vh - ${H}px)`;
-    sc.style.maxHeight = `calc(100vh - ${H}px)`;
-  }
-
-  function apply(){
-    const activeTab = (location.hash || '').replace('#','').toLowerCase();
-    if (!targetTabs.includes(activeTab)) return;
-    const hdr = getHeader();
-    if (hdr) makeStickyHeader(hdr);
-    const pane = document.querySelector(`[data-tab="${activeTab}"]`) || document.querySelector(`#${activeTab}`);
-    if (pane) resizeScroll(pane);
-  }
-
-  window.addEventListener('hashchange', apply);
-  window.addEventListener('resize', apply);
-  document.addEventListener('DOMContentLoaded', apply);
-  new MutationObserver(apply).observe(document.body,{subtree:true,childList:true});
-})();
-// --- Generic pane scroller (keeps top bar static, scrolls inside each pane) ---
-(function(){
-  if (window.__IOC_PANE_SCROLLER__) return; window.__IOC_PANE_SCROLLER__ = true;
-
-  function ensureOnePaneScroller(pane){
-    if (!pane) return;
-
-    // We keep the first heading (H2/H3 with the pane title) above the scroller.
-    // All other siblings become scrollable content.
-    let scroller = pane.querySelector(':scope > .pane-scroller');
-    if (!scroller){
-      scroller = document.createElement('div');
-      scroller.className = 'pane-scroller';
-
-      // Pick a stable header node if present
-      const header = Array.from(pane.children).find(n=>{
-        if (!n || n.nodeType!==1) return false;
-        const tag = (n.tagName||'').toUpperCase();
-        if (tag==='H1' || tag==='H2' || tag==='H3') return true;
-        // Some themes use a title div; keep anything that literally says History / Wallet Tools / Address / Settings at the top.
-        const txt = (n.textContent||'').trim().toLowerCase();
-        return /^history$|wallet\s*tools|address\s*book|settings/.test(txt);
-      });
-
-      // Move the rest of the nodes into the scroller, keep header in place
-      const kids = Array.from(pane.children);
-      kids.forEach(k=>{
-        if (k!==header) scroller.appendChild(k);
-      });
-      pane.appendChild(scroller);
-    }
-
-    // Compute max height available under the pane's top
-    const rect = pane.getBoundingClientRect();
-    // Space to keep for bottom shadow/margins
-    const bottomPad = 32;
-    let maxH = window.innerHeight - rect.top - bottomPad;
-    if (maxH < 180) maxH = 180;
-
-    scroller.style.maxHeight = Math.floor(maxH) + 'px';
-  }
-
-  function ensureAll(){
-    // Work on all visible pages (tabs)
-    const panes = document.querySelectorAll('.page:not(.hidden)');
-    if (!panes.length) return;
-    panes.forEach(ensureOnePaneScroller);
-  }
-
-  // Run now and on layout mutations
-  const kick = ()=>{ try { ensureAll(); } catch(e){} };
-  if (document.readyState==='loading') {
-    document.addEventListener('DOMContentLoaded', kick, {once:true});
-  } else {
-    kick();
-  }
-  window.addEventListener('resize', kick);
-  window.addEventListener('hashchange', kick);
-  new MutationObserver(kick).observe(document.documentElement, {childList:true, subtree:true});
-})();
-
-// --- IOC pane scroller (History / Address / Settings) ---
-(() => {
-  if (window.__IOC_PANE_SCROLLERS__) return;  // guard against double-inject
-  window.__IOC_PANE_SCROLLERS__ = true;
-
-  // Light CSS, injected once
-  function ensurePaneScrollCSS() {
-    if (document.getElementById('ioc-pane-scroll-css')) return;
-    const css = document.createElement('style');
-    css.id = 'ioc-pane-scroll-css';
-    css.textContent = `
-      /* only affect our internal wrapper */
-      .pane-scroller {
-        overflow: auto;
-        -webkit-overflow-scrolling: touch;
-      }
-    `;
-    document.head.appendChild(css);
-  }
-
-  // Make a single tab's inner content scroll within the window
-  function ensureOneTabScroll(tab) {
-    if (!tab) return;
-
-    // Wrap existing children into a single scrolling container (once).
-    let wrap = tab.querySelector(':scope > .pane-scroller');
-    if (!wrap) {
-      wrap = document.createElement('div');
-      wrap.className = 'pane-scroller';
-      // Move all existing children into the wrapper to preserve visuals
-      while (tab.firstChild) wrap.appendChild(tab.firstChild);
-      tab.appendChild(wrap);
-    }
-
-    // Compute available height from the tab's top down to window bottom
-    const top = tab.getBoundingClientRect().top;
-    const pad = 24; // bottom padding so content doesn't touch the edge
-    const avail = Math.max(260, window.innerHeight - top - pad);
-
-    wrap.style.maxHeight = avail + 'px';
-  }
-
-  function ensurePaneScrollers() {
-    ensurePaneScrollCSS();
-    ['tab-history','tab-address','tab-settings'].forEach(id => {
-      const tab = document.getElementById(id);
-      if (tab && !tab.classList.contains('hidden')) {
-        ensureOneTabScroll(tab);
-      }
-    });
-  }
-
-  // Run on load and whenever layout can change
-  const kick = () => { try { ensurePaneScrollers(); } catch(_){} };
-  document.addEventListener('DOMContentLoaded', kick, { once: true });
-  window.addEventListener('resize', kick);
-  window.addEventListener('hashchange', kick);
-  new MutationObserver(kick).observe(document.documentElement, { subtree: true, childList: true, attributes: true });
-
-  // Also kick after a short delay in case tabs mount late
-  setTimeout(kick, 200);
-  setTimeout(kick, 600);
-})();
-
-// Balance font sizing is handled solely by fitBalance() (canvas-based, line ~479)
-
-// --- hotfix: nudge sync line closer to staking (upwards) ---
-
-
-
-// --- hotfix: precisely nudge "Syncing wallet" line up and trim bottom padding ---
-(() => {
-  function nudgeSync() {
-    // Find the visible element that shows "Syncing wallet ..."
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
-    let syncEl = null;
-    while (walker.nextNode()) {
-      const el = walker.currentNode;
-      if (!el || !el.textContent) continue;
-      const txt = el.textContent.trim();
-      if (/^Syncing wallet\s*\(/i.test(txt)) { syncEl = el; break; }
-    }
-    if (!syncEl) return;
-
-    // Pull the line upward
-    syncEl.style.transform = "translateY(-6px)";
-    syncEl.style.display   = "block";       // ensure transform applies cleanly
-
-    // Also trim extra bottom padding on its nearest section/card to avoid clipping
-    let host = syncEl.closest('.card, .panel, .section, .overview, .content');
-    if (host) {
-      host.style.paddingBottom = "12px";
-      host.style.marginBottom  = "0px";
-      host.style.overflow      = "visible";
-    }
-
-    // Guard against live updates resetting layout
-    const obs = new MutationObserver(() => {
-      syncEl.style.transform = "translateY(-6px)";
-      if (host) {
-        host.style.paddingBottom = "12px";
-        host.style.marginBottom  = "0px";
-        host.style.overflow      = "visible";
-      }
-    });
-    obs.observe(syncEl, {childList:true, subtree:true, characterData:true});
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", nudgeSync);
-  } else {
-    nudgeSync();
-  }
-})();
-
-// THEME-SECTION-FIX START
-(function(){
-  const run = () => {
+  try {
     try {
-      // Try to scope to the Settings pane
-      const settingsPane =
-        document.getElementById('settingsPane') ||
-        document.querySelector('[data-pane="settings"], #settings, .settings-pane') ||
-        document.querySelector('*[class*="settings"]');
+      await window.ioc.rpc('walletpassphrase', [passphrase, 300]);
+    } catch (_) {
+      // Continue: some wallets may already be unlocked.
+    }
 
-      if (!settingsPane) return;
+    try {
+      await window.ioc.rpc('dumpwalletRT', [targetPath]);
+    } catch (firstError) {
+      const details = extractRpcError(firstError);
+      if (/not\s*found|method\s*not\s*found/i.test(details)) {
+        await window.ioc.rpc('dumpwallet', [targetPath]);
+      } else {
+        throw firstError;
+      }
+    }
 
-      // Find the Theme heading
-      const headers = settingsPane.querySelectorAll('h1,h2,h3,h4,div,span,label');
-      let themeHeader = null;
-      headers.forEach(el => {
-        const t = (el.textContent || '').trim().toLowerCase();
-        if (!themeHeader && t === 'theme') themeHeader = el;
-      });
-      if (!themeHeader) return;
-
-      // Get a reasonable container for the theme controls
-      const card = themeHeader.closest('.card, .panel, .section, .box') || themeHeader.parentElement;
-      if (!card) return;
-
-      // Locate the color input and the two buttons
-      const color = card.querySelector('input[type="color"]');
-      const btns = Array.from(card.querySelectorAll('button'));
-      const applyBtn = btns.find(b => /apply/i.test(b.textContent || ''));
-      const resetBtn = btns.find(b => /reset/i.test(b.textContent || ''));
-
-      if (!color || !applyBtn || !resetBtn) return;
-
-      // Prevent running twice
-      if (card.dataset.themeFixApplied === '1') return;
-      card.dataset.themeFixApplied = '1';
-
-      // Center header
-      Object.assign(themeHeader.style, {
-        textAlign: 'center',
-        margin: '6px 0 10px',
-        fontWeight: '600',
-        letterSpacing: '0.3px'
-      });
-
-      // Card aesthetics to match other inner cards - dark blue theme
-      Object.assign(card.style, {
-        borderRadius: '18px',
-        background: 'rgba(11, 26, 51, 0.85)',
-        boxShadow: 'inset 0 0 0 1px rgba(26,51,82,0.3), 0 10px 24px rgba(0,0,0,0.35)',
-        padding: '18px 22px 24px'
-      });
-
-      // Build a fresh, centered row and place controls APPLY – COLOR – RESET
-      const row = document.createElement('div');
-      Object.assign(row.style, {
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        gap: '18px',
-        marginTop: '8px',
-        flexWrap: 'wrap'
-      });
-
-      // Keep any existing rows intact; add ours at the end for stability
-      card.appendChild(row);
-      row.appendChild(applyBtn);
-      row.appendChild(color);
-      row.appendChild(resetBtn);
-
-      // Style the color picker like a small control chip - dark blue theme
-      Object.assign(color.style, {
-        width: '56px',
-        height: '32px',
-        border: '1px solid rgba(26,51,82,0.5)',
-        borderRadius: '10px',
-        background: '#122844',
-        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.04), 0 1px 2px rgba(0,0,0,0.3)',
-        padding: '0',
-        cursor: 'pointer'
-      });
-
-      // Nudge buttons for visual balance
-      [applyBtn, resetBtn].forEach(b => {
-        b.style.minWidth = '110px';
-      });
+    try {
+      await window.ioc.rpc('walletlock', []);
     } catch (_) {}
+
+    alert(`Dump created:\n${targetPath}`);
+  } catch (error) {
+    alert(`Dump failed: ${extractRpcError(error) || 'unknown error'}`);
+  }
+}
+
+async function importWalletFromFile() {
+  const pathInput = await promptWithModal({
+    title: 'Absolute path to wallet dump (.txt)',
+    placeholder: 'C:\\Users\\<user>\\Downloads\\ioc-wallet-dump-YYYYMMDD.txt'
+  });
+  if (!pathInput) return;
+
+  const sourcePath = String(pathInput).trim();
+  if (!isAbsoluteWalletPath(sourcePath)) {
+    alert('Use an absolute path for import.');
+    return;
+  }
+
+  try {
+    await window.ioc.rpc('importwallet', [sourcePath]);
+    alert(`Import started:\n${sourcePath}`);
+  } catch (error) {
+    alert(`Import failed: ${extractRpcError(error) || 'unknown error'}`);
+  }
+}
+
+async function runWalletBackup() {
+  const backupButton = $('backupWalletBtn');
+  if (!backupButton || backupButton.disabled) return;
+
+  backupButton.disabled = true;
+  try {
+    const result = await window.ioc.walletBackup();
+    if (!result?.ok) {
+      if (result?.canceled) return;
+      alert(result?.error || 'Backup failed');
+      return;
+    }
+    alert(`Backup saved to:\n${result.savedTo}`);
+  } catch (error) {
+    alert(`Backup failed: ${extractRpcError(error) || 'unknown error'}`);
+  } finally {
+    backupButton.disabled = false;
+  }
+}
+
+function initWalletToolsActions() {
+  wireClickOnce('btnDump', (event) => {
+    event.preventDefault();
+    dumpWalletToFile();
+  });
+
+  wireClickOnce('btnImport', (event) => {
+    event.preventDefault();
+    importWalletFromFile();
+  });
+
+  wireClickOnce('btnOpenPath', (event) => {
+    event.preventDefault();
+    if (window.sys?.openFolder) {
+      window.sys.openFolder();
+    }
+  });
+
+  wireClickOnce('backupWalletBtn', (event) => {
+    event.preventDefault();
+    runWalletBackup();
+  });
+
+  wireClickOnce('btnExplorer', (event) => {
+    event.preventDefault();
+    if (window.ioc?.openExternal) {
+      window.ioc.openExternal('https://iocexplorer.online');
+    }
+  });
+}
+
+function initSettingsLiveDebug() {
+  const output = $('live-tail');
+  const toggle = $('start-tail');
+  if (!output || !toggle || !window.diag) return;
+  if (toggle.dataset.liveDebugInit === '1') return;
+  toggle.dataset.liveDebugInit = '1';
+
+  const debugPanel = output.closest('.debug-log');
+  const settingsWrap = output.closest('.settings-wrap');
+
+  let open = false;
+  let unsubscribe = null;
+
+  const stopTail = () => {
+    if (unsubscribe) {
+      try { unsubscribe(); } catch (_) {}
+      unsubscribe = null;
+    }
+    try { window.diag.stopTail(); } catch (_) {}
   };
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', run, { once: true });
-  } else {
-    run();
-  }
+  const setOpenState = (next) => {
+    open = !!next;
+    output.classList.toggle('hidden', !open);
+    debugPanel?.classList.toggle('live-open', open);
+    settingsWrap?.classList.toggle('live-debug-open', open);
+    toggle.textContent = open ? 'Close Live Debug' : 'Show Live Debug';
+  };
 
-  // Also try again when switching tabs if your UI swaps panes dynamically
-  window.addEventListener('hashchange', run);
-})();
-// THEME-SECTION-FIX END
+  const appendLine = (line) => {
+    if (!open) return;
+    const stickToBottom = isLogNearBottom(output);
+    appendStyledLogChunk(output, line, {
+      stickToBottom,
+      maxLines: MAX_LOG_LINES,
+      maxLineLength: 160
+    });
+    output.classList.remove('empty');
+  };
 
-// ==== THEME_CARD_ENHANCER_V2 ===============================================
-// Wrap the existing Theme controls in a Wallet-Tools-style "card", center the
-// title, and place the color picker between APPLY and RESET. Non-destructive.
-(() => {
-  const STYLE_ID = 'theme-card-enhancer-style';
-  function injectStyle() {
-    if (document.getElementById(STYLE_ID)) return;
-    const st = document.createElement('style'); st.id = STYLE_ID;
-    st.textContent = `
-      /* Card shell (match Wallet Tools look) - dark blue theme */
-      .card.theme-card{
-        background: #0B1A33;
-        border-radius: 20px;
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.02), 0 18px 28px rgba(0,0,0,0.4);
-        padding: 22px 22px 26px;
-        margin: 24px 18px 28px;
-      }
-      .theme-card .card-inner{
-        background: #0F223D;
-        border-radius: 16px;
-        padding: 22px;
-      }
-      .theme-card .card-title{
-        color: #d9e5ea;
-        text-align: center;
-        font-weight: 700;
-        letter-spacing: .2px;
-        font-size: 20px;
-        margin: 4px 0 18px;
-      }
-      /* Row with APPLY [picker] RESET centered */
-      .theme-card .accent-row{
-        display:flex; align-items:center; justify-content:center; gap:22px;
-      }
-      /* Give the picker a compact, pill-like frame to match buttons */
-      .theme-card input[type="color"]{
-        -webkit-appearance: none; appearance: none;
-        width: 58px; height: 34px;
-        border-radius: 10px; border: 2px solid #1A3352;
-        background: var(--accent,#33A2DA); padding:0; cursor:pointer;
-      }
-      .theme-card input[type="color"]::-webkit-color-swatch-wrapper{ padding:0; }
-      .theme-card input[type="color"]::-webkit-color-swatch{
-        border: none; border-radius: 8px;
-      }
-    `;
-    document.head.appendChild(st);
-  }
+  const openPanel = async () => {
+    setOpenState(true);
+    appendStyledLogChunk(output, '', {
+      replace: true,
+      stickToBottom: true,
+      maxLines: MAX_LOG_LINES,
+      maxLineLength: 160
+    });
+    output.classList.add('empty');
 
-  // Try to locate the Settings tab container and theme controls robustly
-  function findSettingsHost() {
-    return (
-      document.querySelector('#tab-settings') ||
-      document.querySelector('[data-tab="settings"]') ||
-      document.getElementById('settings') ||
-      document.body
-    );
-  }
-
-  function ensureCard() {
-    const host = findSettingsHost();
-    if (!host || document.getElementById('themeCard')) return;
-
-    // Find existing Theme bits (label/title, color input, buttons)
-    const allButtons = Array.from(host.querySelectorAll('button'));
-    const btnApply = allButtons.find(b => /apply/i.test(b.textContent || ''));
-    const btnReset = allButtons.find(b => /reset/i.test(b.textContent || ''));
-    const colorInput =
-      host.querySelector('input[type="color"]') ||
-      host.querySelector('#accentPick') ||
-      host.querySelector('#accentPicker');
-
-    // Find an existing "Theme" header near the controls if present
-    let themeTitle =
-      Array.from(host.querySelectorAll('h1,h2,h3,h4,label,div'))
-        .find(el => /^\s*theme\s*$/i.test(el.textContent || ''));
-
-    // If we don't have at least APPLY + RESET + a color input, bail quietly.
-    if (!(btnApply && btnReset && colorInput)) return;
-
-    injectStyle();
-
-    // Build card
-    const card = document.createElement('div');
-    card.className = 'card theme-card';
-    card.id = 'themeCard';
-    const inner = document.createElement('div');
-    inner.className = 'card-inner';
-
-    const title = document.createElement('div');
-    title.className = 'card-title';
-    title.textContent = 'Theme';
-
-    const row = document.createElement('div');
-    row.className = 'accent-row';
-
-    // Re-home existing nodes into the centered row: APPLY [picker] RESET
-    row.appendChild(btnApply);
-    row.appendChild(colorInput);
-    row.appendChild(btnReset);
-
-    inner.appendChild(row);
-    card.appendChild(title);
-    card.appendChild(inner);
-
-    // Insert card just before any existing footer space of the settings pane
-    // or at the end of host as a fallback.
-    const anchor =
-      host.querySelector('.settings-footer') ||
-      host.lastElementChild;
-    if (anchor && anchor.parentNode === host) {
-      host.insertBefore(card, anchor.nextSibling);
-    } else {
-      host.appendChild(card);
-    }
-
-    // If there was a free-floating Theme label/row, hide its original wrapper
-    // to avoid duplicate UI (best-effort; safe to ignore if not found).
-    
-    if (themeTitle) {
-      // Find the card/panel container that originally held Theme
-      let wrap = themeTitle.closest(".panel, .card, .section, .pane, div");
-      if (wrap && wrap !== card && !wrap.contains(card)) {
-        const container = wrap.closest(".panel, .card, .section, .pane") || wrap;
-        // Remove the whole empty container (not just its inner div)
-        if (container.remove) { container.remove(); } else { container.style.display = "none"; }
-        // Also remove an immediately previous empty card/panel that might be acting as a spacer
-        const prev = container.previousElementSibling;
-        const isCardLike = p => p && p.classList && /(?:panel|card|section|pane)/.test(p.className);
-        const isEmpty    = p => p && !(p.querySelector("button,input,select,textarea")) && ((p.textContent||"").trim().length === 0);
-        if (isCardLike(prev) && isEmpty(prev)) {
-          if (prev.remove) { prev.remove(); } else { prev.parentNode && prev.parentNode.removeChild(prev); }
+    try {
+      const recent = await window.diag.recentTail(MAX_LOG_LINES);
+      if (recent) {
+        appendStyledLogChunk(output, recent, {
+          replace: true,
+          stickToBottom: true,
+          maxLines: MAX_LOG_LINES,
+          maxLineLength: 160
+        });
+        if ((output.textContent || '').trim()) {
+          output.classList.remove('empty');
         }
       }
-    }
-  
-  }
+    } catch (_) {}
 
-  // Run once at load, and again when Settings becomes visible (cheap observer)
-  function init() {
-    ensureCard();
-    // Re-check when user switches tabs or DOM mutates
-    let armed = false;
-    const obs = new MutationObserver(() => {
-      if (armed) return;
-      armed = true;
-      setTimeout(() => { armed = false; ensureCard(); }, 60);
+    stopTail();
+    unsubscribe = window.diag.onData(appendLine);
+    try { window.diag.startTail(); } catch (_) {}
+  };
+
+  const closePanel = () => {
+    setOpenState(false);
+    stopTail();
+  };
+
+  toggle.addEventListener('click', () => {
+    if (open) {
+      closePanel();
+    } else {
+      openPanel();
+    }
+  });
+
+  document.querySelectorAll('.tab[data-tab]').forEach((tab) => {
+    if (tab.dataset.liveDebugCloseWired === '1') return;
+    tab.dataset.liveDebugCloseWired = '1';
+    tab.addEventListener('click', () => {
+      if ((tab.dataset.tab || '') !== 'settings') closePanel();
     });
-    obs.observe(document.body, { childList: true, subtree: true });
-  }
+  });
+}
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init, { once: true });
+const COMPACT_ICON_EXPAND = 'M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM4 14h2v4h4v2H4v-6zm14 0h2v6h-6v-2h4v-4z';
+const COMPACT_ICON_COLLAPSE = 'M10 10H4V8h4V4h2v6zm4 0V4h2v4h4v2h-6zm-4 4v6H8v-4H4v-2h6zm10 0v2h-4v4h-2v-6h6z';
+
+function updateCompactToggleUI(isCompact) {
+  const button = $('ic-compact');
+  const path = $('p-compact');
+  if (!button || !path) return;
+
+  if (isCompact) {
+    path.setAttribute('d', COMPACT_ICON_EXPAND);
+    button.title = 'Expand wallet';
+    button.setAttribute('aria-label', 'Expand wallet');
   } else {
-    init();
+    path.setAttribute('d', COMPACT_ICON_COLLAPSE);
+    button.title = 'Compact wallet';
+    button.setAttribute('aria-label', 'Compact wallet');
   }
-})();
-// ===========================================================================
+}
 
-
-// === IOC UI: Theme paddings = Wallet Tools paddings (auto-sync) ===
-(function(){
-  if (window.__IOC_THEME_PAD_SYNC__) return; window.__IOC_THEME_PAD_SYNC__ = true;
-
-  function text(el){ return (el && el.textContent || '').trim(); }
-  function byHeading(root, exact){
-    const hs = root.querySelectorAll('h1,h2,h3,h4,.card-title');
-    for (const h of hs){ if (text(h).toLowerCase() === exact) return h.closest('.card,.panel,.section,div'); }
-    return null;
-  }
-  function getTools(){
-    return document.querySelector('.wallet-tools,.tools-card,#walletTools,[data-section="wallet-tools"]')
-        || byHeading(document,'wallet tools');
-  }
-  function getTheme(){
-    return document.querySelector('.theme-card,#themeBlock,.theme,[data-section="theme"]')
-        || byHeading(document,'theme');
+function syncCompactWidgetValues() {
+  const mainBalance = $('big-balance');
+  const widgetBalance = $('widget-balance');
+  if (mainBalance && widgetBalance) {
+    widgetBalance.innerHTML = mainBalance.innerHTML || mainBalance.textContent || '-';
   }
 
-  function copyBoxModel(fromEl, toEl){
-    if (!fromEl || !toEl) return;
-    const cs = getComputedStyle(fromEl);
-    toEl.style.padding      = cs.padding;
-    toEl.style.borderRadius = cs.borderRadius;
-    toEl.style.border       = cs.border;
-    toEl.style.boxShadow    = cs.boxShadow;
-    // keep margins untouched; panel spacing is handled elsewhere
-    // do not set width/height/display to avoid layout regressions
+  const mainStaking = $('staking');
+  const widgetStaking = $('widget-staking');
+  if (mainStaking && widgetStaking) {
+    widgetStaking.textContent = mainStaking.textContent || '0';
   }
 
-  function syncThemePads(){
-    const tools = getTools();
-    const theme = getTheme();
-    if (!tools || !theme) return;
+  const pendingLine = $('pending-line');
+  const widgetPending = $('widget-pending');
+  const pendingAmount = $('pending-amt');
+  const widgetPendingAmount = $('widget-pending-amt');
+  if (widgetPending && widgetPendingAmount) {
+    const pendingVisible = !!pendingLine && !pendingLine.classList.contains('hidden');
+    const amountText = pendingAmount?.textContent || '0';
+    widgetPending.classList.toggle('hidden', !pendingVisible);
+    widgetPendingAmount.textContent = amountText;
+  }
+}
 
-    // outer panel paddings/border/shadow
-    copyBoxModel(tools, theme);
+function setCompactModeState(isCompact, options = {}) {
+  const persist = options.persist !== false;
+  const refitBalance = options.refitBalance !== false;
 
-    // inner well paddings if both sides have one
-    const toolsInner = tools.querySelector('.tools-inner,.card-body,.inner,.well') || tools.firstElementChild;
-    const themeInner = theme.querySelector('.theme-inner,.card-body,.inner,.well');
-    if (toolsInner && themeInner){
-      const ci = getComputedStyle(toolsInner);
-      themeInner.style.padding      = ci.padding;
-      themeInner.style.borderRadius = ci.borderRadius;
-      themeInner.style.backgroundColor = ci.backgroundColor;
-    }
+  document.body.classList.toggle('compact-mode', !!isCompact);
+  updateCompactToggleUI(!!isCompact);
 
-    // button row spacing to mirror tools (gap + top margin if present)
-    const toolsBtns = tools.querySelector('.btn-row,.actions,.buttons') || null;
-    const themeBtns = theme.querySelector('.btn-row,.actions,.buttons') || null;
-    if (toolsBtns && themeBtns){
-      const cb = getComputedStyle(toolsBtns);
-      themeBtns.style.gap       = cb.gap;
-      themeBtns.style.marginTop = cb.marginTop;
-      themeBtns.style.justifyContent = cb.justifyContent;
-      themeBtns.style.alignItems     = cb.alignItems;
-      themeBtns.style.display        = 'flex';
-    }
+  if (isCompact) {
+    syncCompactWidgetValues();
   }
 
-  // run now and keep in sync on re-renders
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', syncThemePads, {once:true});
-  } else {
-    syncThemePads();
-  }
-  new MutationObserver(syncThemePads).observe(document.documentElement, {childList:true, subtree:true});
-  window.addEventListener('hashchange', syncThemePads, false);
-})();
-// === /IOC UI ===
-
-// [__IOC_THEME_MATCH_TOOLS_PADS__] Copy Wallet Tools paddings to Theme panel (outer + inner)
-(function(){
-  if (window.__IOC_THEME_MATCH_TOOLS_PADS__) return;
-  window.__IOC_THEME_MATCH_TOOLS_PADS__ = true;
-
-  function txt(n){ return (n && n.textContent || '').trim().toLowerCase(); }
-  function byHeading(root, key){
-    const hs = root.querySelectorAll('h1,h2,h3,h4,.card-title');
-    for (const h of hs) if (txt(h) === key) return h.closest('.card,.panel,.section,div');
-    return null;
-  }
-  function getTools(root){
-    return root.querySelector('.wallet-tools,.tools-card,#walletTools,[data-section="wallet-tools"]')
-        || byHeading(root,'wallet tools');
-  }
-  function getTheme(root){
-    return root.querySelector('.theme-card,#themeBlock,.theme,[data-section="theme"]')
-        || byHeading(root,'theme');
-  }
-  function sync(){
-    const root = document;
-    const tools = getTools(root);
-    const theme = getTheme(root);
-    if (!tools || !theme) return;
-
-    // Outer paddings/border radius/border/shadow – exact copy
-    const cs = getComputedStyle(tools);
-    theme.style.padding      = cs.padding;
-    theme.style.borderRadius = cs.borderRadius;
-    theme.style.border       = cs.border;
-    theme.style.boxShadow    = cs.boxShadow;
-    theme.style.backgroundColor = cs.backgroundColor;
-
-    // Inner well paddings – copy if both sides have one, otherwise make one
-    const toolsInner = tools.querySelector('.tools-inner,.card-body,.inner,.well') || tools.firstElementChild;
-    let   themeInner = theme.querySelector('.theme-inner,.card-body,.inner,.well');
-
-    if (!themeInner){
-      // create a wrapper to receive inner paddings without affecting header
-      themeInner = document.createElement('div');
-      themeInner.className = 'theme-inner';
-      // move buttons/content into the inner wrapper
-      const toMove = [];
-      for (const ch of Array.from(theme.childNodes)) {
-        if (!(ch.matches && ch.matches('h1,h2,h3,.card-title'))) toMove.push(ch);
-      }
-      toMove.forEach(n => themeInner.appendChild(n));
-      theme.appendChild(themeInner);
-    }
-
-    if (toolsInner){
-      const ci = getComputedStyle(toolsInner);
-      themeInner.style.padding      = ci.padding;
-      themeInner.style.borderRadius = ci.borderRadius;
-      themeInner.style.backgroundColor = ci.backgroundColor;
-    }
-
-    // Button row spacing (gap + top margin) – mirrors Tools if present
-    const toolsBtns = tools.querySelector('.btn-row,.actions,.buttons');
-    const themeBtns = theme.querySelector('.btn-row,.actions,.buttons');
-    if (toolsBtns && themeBtns){
-      const cb = getComputedStyle(toolsBtns);
-      themeBtns.style.display        = 'flex';
-      themeBtns.style.justifyContent = cb.justifyContent;
-      themeBtns.style.alignItems     = cb.alignItems;
-      themeBtns.style.gap            = cb.gap;
-      themeBtns.style.marginTop      = cb.marginTop;
-    }
+  if (!isCompact && refitBalance) {
+    requestAnimationFrame(() => requestAnimationFrame(() => fitBalance()));
+    setTimeout(() => fitBalance(), 250);
   }
 
-  // run now and on any re-render/nav
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', sync, {once:true});
-  } else {
-    sync();
-  }
-  new MutationObserver(sync).observe(document.documentElement, {childList:true, subtree:true});
-  window.addEventListener('hashchange', sync, false);
-})();
-
-// [__IOC_THEME_WIDTH_MATCH_TOOLS__] Copy Wallet Tools width to Theme panel
-(function(){
-  if (window.__IOC_THEME_WIDTH_MATCH_TOOLS__) return;
-  window.__IOC_THEME_WIDTH_MATCH_TOOLS__ = true;
-
-  function byHeading(root, key){
-    const hs = root.querySelectorAll('h1,h2,h3,h4,.card-title');
-    for (const h of hs) if ((h.textContent||'').trim().toLowerCase() === key) return h.closest('.card,.panel,div');
-    return null;
-  }
-  function getTools(root){
-    return root.querySelector('.wallet-tools,#walletTools,[data-section="wallet-tools"]')
-        || byHeading(root,'wallet tools');
-  }
-  function getTheme(root){
-    return root.querySelector('.theme-card,#themeBlock,[data-section="theme"]')
-        || byHeading(root,'theme');
-  }
-  function sync(){
-    const root = document;
-    const tools = getTools(root);
-    const theme = getTheme(root);
-    if (!tools || !theme) return;
-    const cs = getComputedStyle(tools);
-    theme.style.maxWidth = cs.maxWidth !== 'none' ? cs.maxWidth : cs.width;
-    theme.style.width    = cs.width;
-    theme.style.marginLeft = cs.marginLeft;
-    theme.style.marginRight = cs.marginRight;
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', sync, {once:true});
-  } else {
-    sync();
-  }
-  new MutationObserver(sync).observe(document.documentElement, {childList:true, subtree:true});
-})();
-
-// [__IOC_THEME_FILL_MATCH_TOOLS_STRICT__]
-// Make Theme's inner well a single FILLED block identical to Wallet Tools.
-// - Finds cards by heading text ("Wallet Tools" / "Theme") or common classes
-// - Copies computed styles from Tools' inner well to Theme's innermost well
-// - Neutralizes any middle wrapper that causes a hollow/inset look
-(function(){
-  if (window.__IOC_THEME_FILL_MATCH_TOOLS_STRICT__) return;
-  window.__IOC_THEME_FILL_MATCH_TOOLS_STRICT__ = true;
-
-  function lower(n){ return (n && n.textContent || '').trim().toLowerCase(); }
-  function byHeading(root, name){
-    const hs = root.querySelectorAll('h1,h2,h3,h4,.card-title');
-    name = (name||'').toLowerCase();
-    for (const h of hs){ if (lower(h) === name) return h.closest('.card,.panel,.section,.pane,div'); }
-    return null;
-  }
-  function getTools(root){
-    return root.querySelector('.wallet-tools,.tools-card,#walletTools,[data-section="wallet-tools"]')
-        || byHeading(root,'wallet tools');
-  }
-  function getTheme(root){
-    return root.querySelector('.theme-card,#themeBlock,.theme,[data-section="theme"]')
-        || byHeading(root,'theme');
-  }
-  function firstInner(el){
-    // Prefer named inner wells; else use first element child
-    return el && ( el.querySelector('.tools-inner,.theme-inner,.card-body,.inner,.well') || el.firstElementChild );
-  }
-  function deepest(el){
-    // Walk down single-child chains to the deepest content box (buttons live here)
-    let cur = el;
-    while (cur && cur.firstElementChild && cur.children.length === 1) cur = cur.firstElementChild;
-    return cur || el;
-  }
-  function copyStyles(from, to){
-    const cs = getComputedStyle(from);
-    to.style.backgroundColor = cs.backgroundColor;
-    to.style.borderRadius    = cs.borderRadius;
-    to.style.padding         = cs.padding;
-    to.style.boxShadow       = cs.boxShadow;
-    to.style.border          = cs.border;
-    to.style.width           = '100%';
-    to.style.display         = 'block';
-    to.style.margin          = '0';
-  }
-  function neutralizeMiddle(theme, innerFilled){
-    // Any ancestors between theme and innerFilled should not draw a ring
-    let p = innerFilled.parentElement;
-    while (p && p !== theme){
-      p.style.background   = 'transparent';
-      p.style.boxShadow    = 'none';
-      p.style.border       = '0';
-      p.style.padding      = '0';
-      p.style.margin       = '0';
-      p = p.parentElement;
-    }
-  }
-  function moveButtonsInside(inner){
-    const buttonsRow = inner.querySelector('.btn-row,.actions,.buttons') ||
-                       inner.querySelector('button')?.parentElement;
-    if (!buttonsRow) return;
-    // Ensure spacing like Tools (centered w/ gap)
-    const s = buttonsRow.style;
-    s.display        = 'flex';
-    s.justifyContent = 'center';
-    s.alignItems     = 'center';
-    if (!s.gap) s.gap = '18px';
-    if (!s.marginTop) s.marginTop = '16px';
-  }
-
-  function sync(){
-    const root  = document;
-    const tools = getTools(root);
-    const theme = getTheme(root);
-    if (!tools || !theme) return;
-
-    const toolsInner = deepest(firstInner(tools)) || tools;
-    // For Theme: use deepest existing inner; if not present, wrap content
-    let themeInner = deepest(firstInner(theme));
-    if (!themeInner || themeInner === theme){
-      const wrap = document.createElement('div');
-      wrap.className = 'theme-inner';
-      const keep = [];
-      for (const ch of Array.from(theme.childNodes)){
-        if (!(ch.matches && ch.matches('h1,h2,h3,.card-title'))) keep.push(ch);
-      }
-      keep.forEach(n => wrap.appendChild(n));
-      theme.appendChild(wrap);
-      themeInner = wrap;
-    }
-
-    copyStyles(toolsInner, themeInner);
-    neutralizeMiddle(theme, themeInner);
-    moveButtonsInside(themeInner);
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', sync, {once:true});
-  } else {
-    sync();
-  }
-  new MutationObserver(sync).observe(document.documentElement, {childList:true, subtree:true});
-  window.addEventListener('hashchange', sync, false);
-})();
-
-/* ===== Compact Widget Mode ===== */
-(function() {
-  let isCompact = false;
-
-  function updateWidgetValues() {
-    // Sync balance from main display to widget
-    const mainBalance = document.getElementById('big-balance');
-    const widgetBalance = document.getElementById('widget-balance');
-    if (mainBalance && widgetBalance) {
-      widgetBalance.textContent = mainBalance.textContent;
-    }
-
-    // Sync staking from main display to widget
-    const mainStaking = document.getElementById('staking');
-    const widgetStaking = document.getElementById('widget-staking');
-    if (mainStaking && widgetStaking) {
-      widgetStaking.textContent = mainStaking.textContent;
-    }
-  }
-
-  function setCompactMode(compact) {
-    isCompact = compact;
-    document.body.classList.toggle('compact-mode', isCompact);
-    if (isCompact) updateWidgetValues();
-    // Re-fit balance after expanding to full mode
-    if (!isCompact) {
-      requestAnimationFrame(() => requestAnimationFrame(() => fitBalance()));
-      setTimeout(() => fitBalance(), 300);
-    }
-    // Save state
+  if (persist) {
     try {
       localStorage.setItem('ioc-compact-mode', isCompact ? '1' : '0');
-    } catch (e) {}
+    } catch (_) {}
+  }
+}
+
+async function toggleCompactMode() {
+  const wasCompact = document.body.classList.contains('compact-mode');
+  const nextCompact = !wasCompact;
+
+  setCompactModeState(nextCompact, { persist: true, refitBalance: true });
+
+  if (!window.ioc?.setCompactMode) return;
+  try {
+    await window.ioc.setCompactMode(nextCompact);
+  } catch (error) {
+    console.warn('[compact] Failed to sync window mode with main process:', error?.message || error);
+    setCompactModeState(wasCompact, { persist: true, refitBalance: true });
+  }
+}
+
+function initCompactMode() {
+  const button = $('ic-compact');
+  if (!button || button.dataset.compactInit === '1') return;
+  button.dataset.compactInit = '1';
+
+  const initialCompact = document.body.classList.contains('compact-mode');
+  setCompactModeState(initialCompact, { persist: false, refitBalance: false });
+
+  button.addEventListener('click', () => {
+    toggleCompactMode();
+  });
+
+  if (window.ioc?.onCompactModeChanged) {
+    window.ioc.onCompactModeChanged((isCompact) => {
+      setCompactModeState(!!isCompact, { persist: true, refitBalance: true });
+    });
   }
 
-  async function toggleCompact() {
-    isCompact = !isCompact;
-    document.body.classList.toggle('compact-mode', isCompact);
-    if (isCompact) updateWidgetValues();
+  const watchNode = (node) => {
+    if (!node) return;
+    const observer = new MutationObserver(() => {
+      if (document.body.classList.contains('compact-mode')) {
+        syncCompactWidgetValues();
+      }
+    });
+    observer.observe(node, { childList: true, characterData: true, subtree: true });
+  };
 
-    // Tell main process to resize window
-    if (window.ioc && window.ioc.setCompactMode) {
-      await window.ioc.setCompactMode(isCompact);
-    }
+  watchNode($('big-balance'));
+  watchNode($('staking'));
+  watchNode($('pending-line'));
+  watchNode($('pending-amt'));
+}
 
-    // Re-fit balance after expanding to full mode — layout needs time to settle
-    if (!isCompact) {
-      requestAnimationFrame(() => requestAnimationFrame(() => fitBalance()));
-      // Second pass after window resize fully completes
-      setTimeout(() => fitBalance(), 300);
-    }
-
-    // Save state
-    try {
-      localStorage.setItem('ioc-compact-mode', isCompact ? '1' : '0');
-    } catch (e) {}
-  }
-
-  function init() {
-    // Listen for compact mode changes from main process
-    if (window.ioc && window.ioc.onCompactModeChanged) {
-      window.ioc.onCompactModeChanged((compact) => {
-        setCompactMode(compact);
-      });
-    }
-
-    // Add click handler for compact button (stars icon)
-    const compactBtn = document.getElementById('ic-compact');
-    if (compactBtn) {
-      compactBtn.addEventListener('click', toggleCompact);
-    }
-
-    // Start in compact mode (window starts compact)
-    isCompact = true;
-    document.body.classList.add('compact-mode');
-    updateWidgetValues();
-
-    // Observe balance/staking changes to keep widget in sync
-    const mainBalance = document.getElementById('big-balance');
-    if (mainBalance) {
-      new MutationObserver(() => {
-        if (isCompact) updateWidgetValues();
-      }).observe(mainBalance, { childList: true, characterData: true, subtree: true });
-    }
-
-    const mainStaking = document.getElementById('staking');
-    if (mainStaking) {
-      new MutationObserver(() => {
-        if (isCompact) updateWidgetValues();
-      }).observe(mainStaking, { childList: true, characterData: true, subtree: true });
-    }
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init, { once: true });
-  } else {
-    init();
-  }
-})();

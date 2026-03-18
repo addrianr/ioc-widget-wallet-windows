@@ -1,5 +1,6 @@
 {
   "name": "ioc-widget-wallet",
+  "productName": "I/O Coin Widget Wallet",
   "version": "0.1.1-RC9",
   "description": "Minimal Electron front-end for iocoind",
   "main": "src/main/main.js",
@@ -10,95 +11,11 @@
   "license": "MIT",
   "scripts": {
     "dev": "electron .",
-    "build": "electron-builder --mac dmg",
-    "build:mac": "electron-builder --mac dmg",
-    "build:win": "electron-builder --win nsis",
-    "build:linux": "electron-builder --linux AppImage deb"
-  },
-  "build": {
-    "appId": "io.iocoin.wallet",
-    "productName": "IOC Widget Wallet",
-    "mac": {
-      "icon": "assets/icon.icns",
-      "category": "public.app-category.finance",
-      "identity": "Joel Bosh (E3UBUT7VX4)",
-      "hardenedRuntime": true,
-      "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.plist",
-      "extraResources": [
-        {
-          "from": "/Users/taino/Desktop/iocoind",
-          "to": "iocoind"
-        }
-      ]
-    },
-    "win": {
-      "icon": "assets/icon.ico",
-      "target": [
-        {
-          "target": "nsis",
-          "arch": ["x64"]
-        }
-      ],
-      "extraResources": [
-        {
-          "from": "/Users/taino/Desktop/daemon-binaries/win64/iocoind.exe",
-          "to": "iocoind.exe"
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "installerIcon": "assets/icon.ico",
-      "uninstallerIcon": "assets/icon.ico"
-    },
-    "linux": {
-      "icon": "assets/icon.png",
-      "category": "Finance",
-      "target": [
-        {
-          "target": "AppImage",
-          "arch": ["x64"]
-        },
-        {
-          "target": "deb",
-          "arch": ["x64"]
-        }
-      ],
-      "extraResources": [
-        {
-          "from": "/Users/taino/Desktop/daemon-binaries/linux64/iocoind",
-          "to": "iocoind"
-        }
-      ]
-    },
-    "afterSign": "build/notarize.js",
-    "dmg": {
-      "background": "assets/img/dmg-background.png",
-      "iconSize": 80,
-      "window": {
-        "width": 540,
-        "height": 380
-      },
-      "contents": [
-        {
-          "x": 140,
-          "y": 190
-        },
-        {
-          "x": 400,
-          "y": 190,
-          "type": "link",
-          "path": "/Applications"
-        }
-      ]
-    },
-    "files": [
-      "src/**/*",
-      "assets/**/*"
-    ]
+    "build": "electron-builder --config build/electron-builder.config.js",
+    "build:mac": "electron-builder --config build/electron-builder.config.js --mac dmg",
+    "build:win": "electron-builder --config build/electron-builder.config.js --win nsis",
+    "build:linux": "electron-builder --config build/electron-builder.config.js --linux AppImage deb",
+    "test": "jest"
   },
   "dependencies": {
     "axios": "^1.7.2",
@@ -107,6 +24,7 @@
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
     "electron": "^31.3.0",
-    "electron-builder": "^24.13.3"
+    "electron-builder": "^24.13.3",
+    "jest": "^30.3.0"
   }
 }

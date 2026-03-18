@@ -14,6 +14,7 @@ const { pipeline } = require('node:stream/promises');
 const { DATA_DIR, CONF_PATH, isFirstRun } = require('../shared/constants');
 
 const BOOTSTRAP_URL = 'https://iocbootstrap.s3.us-east-2.amazonaws.com/bootstrap.zip';
+const DAILY_BOOTSTRAP_RELEASE_API_URL = 'https://api.github.com/repos/IOCoin/DIONS/releases/tags/DIONS-BootStrap';
 // Download to temp folder to avoid corrupting wallet data
 const BOOTSTRAP_TEMP_DIR = path.join(os.tmpdir(), 'ioc-bootstrap');
 const BOOTSTRAP_ZIP_PATH = path.join(BOOTSTRAP_TEMP_DIR, 'bootstrap.zip');
@@ -379,8 +380,127 @@ function getBootstrapExtractDir() {
   return BOOTSTRAP_EXTRACT_DIR;
 }
 
+function parseBootstrapHeightFromReleaseTitle(title) {
+  if (!title || typeof title !== 'string') return null;
+  // Preferred legacy format: "... = 5552309"
+  const eq = /=(\s*)(\d{4,})/.exec(title);
+  if (eq) {
+    const h = parseInt(eq[2], 10);
+    if (Number.isFinite(h) && h > 0) return h;
+  }
+
+  // Flexible formats:
+  // - "DIONS-BootStrap 5552309"
+  // - "Height 5,552,309"
+  // - "Checkpoint 5.552.309"
+  const tokens = title.match(/\d[\d.,\s]{4,}\d/g) || [];
+  const heights = tokens
+    .map(t => parseInt(String(t).replace(/[^\d]/g, ''), 10))
+    .filter(n => Number.isFinite(n) && n > 0);
+
+  if (!heights.length) return null;
+
+  // IOC chain height should be in the low millions (not dates).
+  // Prefer values in a realistic window first.
+  const realistic = heights.filter(n => n >= 1000000 && n <= 20000000);
+  if (realistic.length) return realistic[realistic.length - 1];
+
+  return heights[heights.length - 1] || null;
+}
+
+function fetchDailyBootstrapMetadata() {
+  return new Promise((resolve) => {
+    const req = https.get(DAILY_BOOTSTRAP_RELEASE_API_URL, {
+      headers: {
+        'User-Agent': 'ioc-widget-wallet',
+        'Accept': 'application/vnd.github+json'
+      },
+      timeout: 8000
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) {
+            resolve({ ok: false, error: `GitHub HTTP ${res.statusCode || 0}` });
+            return;
+          }
+          const json = JSON.parse(data || '{}');
+          const title = String(json.name || '');
+          const tag = String(json.tag_name || '');
+          const body = String(json.body || '');
+          const height =
+            parseBootstrapHeightFromReleaseTitle(title) ||
+            parseBootstrapHeightFromReleaseTitle(tag) ||
+            parseBootstrapHeightFromReleaseTitle(body);
+          if (!height) {
+            resolve({ ok: false, error: 'Could not parse bootstrap height from release title' });
+            return;
+          }
+          resolve({
+            ok: true,
+            height,
+            title,
+            tag,
+            publishedAt: String(json.published_at || ''),
+            htmlUrl: String(json.html_url || ''),
+            apiUrl: DAILY_BOOTSTRAP_RELEASE_API_URL
+          });
+        } catch (err) {
+          resolve({ ok: false, error: err.message || 'Invalid release metadata response' });
+        }
+      });
+    });
+    req.on('error', (err) => resolve({ ok: false, error: err.message || 'Metadata fetch failed' }));
+    req.on('timeout', () => {
+      try { req.destroy(); } catch (_) {}
+      resolve({ ok: false, error: 'Metadata fetch timeout' });
+    });
+  });
+}
+
+function createRebootstrapBackup(context = {}) {
+  try {
+    const backupRoot = path.join(DATA_DIR, 'wallet_backup.rebootstrap');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupDir = path.join(backupRoot, stamp);
+    fs.mkdirSync(backupDir, { recursive: true });
+
+    const files = [];
+    const copyIfExists = (src, filename) => {
+      if (!src || !filename || !fs.existsSync(src)) return;
+      const dest = path.join(backupDir, filename);
+      fs.copyFileSync(src, dest);
+      const stats = fs.statSync(dest);
+      files.push({
+        name: filename,
+        source: src,
+        bytes: stats.size
+      });
+    };
+
+    copyIfExists(path.join(DATA_DIR, 'wallet.dat'), 'wallet.dat');
+    copyIfExists(CONF_PATH, 'iocoin.conf');
+
+    const manifest = {
+      createdAt: new Date().toISOString(),
+      backupDir,
+      dataDir: DATA_DIR,
+      files,
+      context
+    };
+    const manifestPath = path.join(backupDir, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    return { ok: true, backupDir, manifestPath, files };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  }
+}
+
 module.exports = {
   BOOTSTRAP_URL,
+  DAILY_BOOTSTRAP_RELEASE_API_URL,
   needsBootstrap,
   hasBootstrapZip,
   downloadBootstrap,
@@ -388,5 +508,7 @@ module.exports = {
   applyBootstrapFiles,
   cleanupBootstrap,
   getBootstrapZipPath,
-  getBootstrapExtractDir
+  getBootstrapExtractDir,
+  fetchDailyBootstrapMetadata,
+  createRebootstrapBackup
 };

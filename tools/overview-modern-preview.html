@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>I/O Coin Wallet - Modern Overview Preview</title>
+  <style>
+    :root {
+      --bg: #e8e8ec;
+      --frame-outer: #26385a;
+      --frame-inner-a: #0c1b34;
+      --frame-inner-b: #0a1329;
+      --panel: rgba(20, 38, 67, 0.9);
+      --panel-2: rgba(10, 26, 50, 0.86);
+      --line: rgba(102, 206, 255, 0.8);
+      --line-soft: rgba(102, 206, 255, 0.3);
+      --text: #f2f7ff;
+      --text-dim: #b9c8de;
+      --accent: #4aaeea;
+      --accent-2: #3299de;
+      --tab: rgba(8, 21, 42, 0.8);
+      --tab-border: rgba(130, 163, 210, 0.28);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1100px 700px at 50% 8%, #f8f8fb 0%, #ececf1 45%, #e1e1e8 100%);
+      overflow: hidden;
+    }
+
+    .stage {
+      width: 100%;
+      height: 100%;
+      padding: 26px;
+      display: grid;
+      place-items: center;
+    }
+
+    .wallet {
+      position: relative;
+      width: min(1180px, calc(100vw - 46px));
+      height: min(700px, calc(100vh - 46px));
+      border-radius: 30px;
+      border: 2px solid rgba(180, 214, 255, 0.24);
+      background:
+        radial-gradient(120% 180% at 20% 0%, rgba(123, 165, 224, 0.1) 0%, rgba(123, 165, 224, 0) 45%),
+        linear-gradient(180deg, var(--frame-inner-a) 0%, var(--frame-inner-b) 100%);
+      box-shadow:
+        0 24px 56px rgba(11, 16, 34, 0.36),
+        inset 0 1px 0 rgba(255, 255, 255, 0.2),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.35);
+      overflow: hidden;
+      isolation: isolate;
+    }
+
+    .wallet::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        radial-gradient(rgba(170, 207, 255, 0.07) 0.8px, transparent 0.8px),
+        radial-gradient(rgba(170, 207, 255, 0.04) 0.8px, transparent 0.8px);
+      background-size: 3px 3px, 5px 5px;
+      background-position: 0 0, 1px 2px;
+      mix-blend-mode: screen;
+      opacity: 0.45;
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    .topbar {
+      height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 18px;
+    }
+
+    .traffic {
+      display: flex;
+      gap: 10px;
+    }
+
+    .dot {
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      box-shadow: inset 0 -1px 2px rgba(0, 0, 0, 0.45);
+    }
+
+    .dot.red { background: #ff5f57; }
+    .dot.yellow { background: #febc2e; }
+    .dot.green { background: #28c840; }
+
+    .top-icons {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      color: rgba(121, 214, 255, 0.95);
+      opacity: 0.95;
+      font-size: 20px;
+    }
+
+    .tabs {
+      padding: 0 18px 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .tabs-left {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .tab {
+      border: 1px solid var(--tab-border);
+      background: var(--tab);
+      color: rgba(230, 241, 255, 0.95);
+      border-radius: 999px;
+      height: 44px;
+      padding: 0 24px;
+      font-size: 30px;
+      font-size: 29px;
+      line-height: 44px;
+      letter-spacing: 0.01em;
+      font-weight: 500;
+      cursor: default;
+      user-select: none;
+    }
+
+    .tab.active {
+      background: linear-gradient(180deg, #66c7ff 0%, #43aae8 100%);
+      color: #0a2039;
+      border-color: rgba(135, 222, 255, 0.95);
+      box-shadow: 0 6px 18px rgba(58, 162, 225, 0.45);
+      font-weight: 700;
+    }
+
+    .section-line {
+      height: 2px;
+      margin: 0 18px;
+      background: linear-gradient(90deg, var(--line-soft), var(--line), var(--line-soft));
+      border-radius: 2px;
+    }
+
+    .content {
+      height: calc(100% - 100px);
+      padding: 16px 18px 18px;
+    }
+
+    .overview-panel {
+      height: 100%;
+      border-radius: 24px;
+      border: 1px solid rgba(133, 174, 224, 0.22);
+      background: linear-gradient(180deg, rgba(17, 33, 58, 0.88) 0%, rgba(11, 25, 47, 0.9) 100%);
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      gap: 18px;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.07),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.26);
+    }
+
+    .overview-card {
+      width: min(1060px, 100%);
+      border-radius: 22px;
+      border: 1px solid rgba(136, 180, 228, 0.2);
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      padding: 24px 24px 26px;
+      text-align: center;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+
+    .label {
+      margin: 0;
+      color: var(--text-dim);
+      letter-spacing: 0.08em;
+      font-size: 37px;
+      font-size: 36px;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+
+    .balance {
+      margin: 16px 0 18px;
+      font-size: clamp(64px, 8.2vw, 84px);
+      line-height: 1;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: #f7fbff;
+      text-shadow: 0 8px 28px rgba(6, 12, 26, 0.45);
+    }
+
+    .balance .dec {
+      font-size: 0.68em;
+      opacity: 0.93;
+      font-weight: 600;
+      vertical-align: baseline;
+    }
+
+    .staking {
+      margin: 0 0 18px;
+      color: var(--text-dim);
+      font-size: 34px;
+      font-size: 33px;
+      letter-spacing: 0.01em;
+      font-weight: 500;
+    }
+
+    .send {
+      appearance: none;
+      border: 1px solid rgba(137, 217, 255, 0.94);
+      border-radius: 14px;
+      height: 56px;
+      min-width: 176px;
+      padding: 0 26px;
+      color: #f2f9ff;
+      font-size: 31px;
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      background: linear-gradient(180deg, var(--accent) 0%, var(--accent-2) 100%);
+      box-shadow:
+        0 8px 24px rgba(52, 153, 223, 0.4),
+        inset 0 1px 0 rgba(255, 255, 255, 0.35);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+
+    .send .arrow {
+      font-size: 0.88em;
+      opacity: 0.95;
+    }
+
+    @media (max-width: 980px) {
+      .wallet {
+        border-radius: 22px;
+      }
+
+      .topbar {
+        height: 42px;
+      }
+
+      .tab {
+        height: 38px;
+        line-height: 38px;
+        padding: 0 18px;
+        font-size: 18px;
+      }
+
+      .content {
+        height: calc(100% - 92px);
+      }
+
+      .label {
+        font-size: 28px;
+      }
+
+      .staking {
+        font-size: 25px;
+      }
+
+      .send {
+        height: 48px;
+        min-width: 152px;
+        font-size: 24px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <section class="wallet" aria-label="I/O Coin Wallet mockup">
+      <div class="topbar">
+        <div class="traffic" aria-hidden="true">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+        </div>
+        <div class="top-icons" aria-hidden="true">🔒 📶 ⛭ ✦</div>
+      </div>
+
+      <div class="tabs">
+        <div class="tabs-left">
+          <div class="tab active">Overview</div>
+          <div class="tab">History</div>
+          <div class="tab">My Addresses</div>
+          <div class="tab">Saved recipients</div>
+          <div class="tab">Settings</div>
+        </div>
+      </div>
+
+      <div class="section-line"></div>
+
+      <div class="content">
+        <div class="overview-panel">
+          <article class="overview-card">
+            <p class="label">Total I/O Available</p>
+            <div class="balance">374,128<span class="dec">.29</span></div>
+            <p class="staking">STAKING: 2,095.04</p>
+            <button class="send" type="button"><span class="arrow">▶</span>Send</button>
+          </article>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

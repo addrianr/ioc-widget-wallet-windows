@@ -147,6 +147,7 @@ Skip the bootstrap prompt to perform a clean sync from the network. The wallet w
 
 - Node.js (v16 or higher)
 - npm
+- Platform daemon runtime
 
 ### Clone and Install
 
@@ -155,6 +156,17 @@ git clone https://github.com/Wizrig/ioc-widget-wallet.git
 cd ioc-widget-wallet
 npm install
 ```
+
+### Daemon Runtime Inputs
+
+The Electron app bundles the IOCoin daemon from paths provided at build time.
+Windows builds must package the full daemon runtime directory, not only `iocoind.exe`.
+
+- `IOC_DAEMON_WIN_DIR`: folder containing `iocoind.exe` and every required DLL/runtime sidecar
+- `IOC_DAEMON_MAC_PATH`: path to the macOS daemon payload
+- `IOC_DAEMON_LINUX_PATH`: path to the Linux daemon payload
+
+If a required variable is missing, the corresponding build now fails early instead of producing a broken installer.
 
 ### Run in Development Mode
 
@@ -166,16 +178,21 @@ npm run dev
 
 **macOS:**
 ```bash
+export IOC_DAEMON_MAC_PATH=/path/to/iocoind
 npm run build:mac
 ```
 
 **Windows:**
-```bash
+```powershell
+$env:IOC_DAEMON_WIN_DIR='C:\path\to\ioc-win64-runtime'
 npm run build:win
 ```
 
+The folder referenced by `IOC_DAEMON_WIN_DIR` must include `iocoind.exe` plus all DLL dependencies required by that build.
+
 **Linux:**
 ```bash
+export IOC_DAEMON_LINUX_PATH=/path/to/iocoind
 npm run build:linux
 ```
 

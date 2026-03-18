@@ -1,18 +1,21 @@
-<!doctype html>
+﻿<!doctype html>
 <html style="background:#050A12">
 <head>
 <meta charset="utf-8">
-<title>I/O Coin</title>
+<title>I/O Coin Widget Wallet</title>
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self';">
 <style>html,body{background:#050A12;margin:0}</style>
 <link rel="stylesheet" href="styles.css">
 </head>
-<body class="splash-active" style="background:#050A12">
+<body class="compact-mode splash-active" style="background:#050A12">
   <!-- Splash overlay (shown during daemon warmup) -->
   <div id="splashOverlay" class="splash-overlay">
     <div class="splash-content">
-      <img src="../../assets/icon.png" alt="IOCoin" class="splash-logo" onerror="this.style.display='none'">
-      <div id="splashStatus" class="splash-status">Loading daemon…</div>
+      <div class="splash-logo-wrap">
+        <span class="splash-logo-ring" aria-hidden="true"></span>
+        <img src="../../assets/icon.png" alt="IOCoin" class="splash-logo" onerror="this.parentElement.style.display='none'">
+      </div>
+      <div id="splashStatus" class="splash-status">Loading daemonâ€¦</div>
       <div class="splash-progress">
         <div class="splash-bar"></div>
       </div>
@@ -21,7 +24,14 @@
   </div>
 
   <div class="chrome">
-    <div class="title">I/O Coin</div>
+    <div id="syncStatusBadge" class="sync-status-badge" aria-live="polite">STILL SYNCING...</div>
+    <div class="tabs">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="history">History</button>
+      <button class="tab" data-tab="address">My Addresses</button>
+      <button class="tab" data-tab="recipients">Recipients</button>
+      <button class="tab" data-tab="settings">Settings</button>
+    </div>
     <div class="chips">
       <button id="ic-lock" class="chip" title="Wallet locked">
         <svg viewBox="0 0 24 24"><path id="p-lock" d="M12 2a5 5 0 00-5 5v3H6a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2v-8a2 2 0 00-2-2h-1V7a5 5 0 00-5-5zm3 8H9V7a3 3 0 016 0v3z"/></svg>
@@ -32,27 +42,22 @@
       <div id="ic-stake" class="chip" title="Staking off">
         <svg viewBox="0 0 24 24"><path d="M7 21h10l-2-9 3-3-6-6-6 6 3 3-2 9z"/></svg>
       </div>
-      <button id="ic-compact" class="chip" title="Toggle compact widget">
-        <svg viewBox="0 0 24 24"><path d="M12 2l1.09 3.26L16 6l-2.91.74L12 10l-1.09-3.26L8 6l2.91-.74L12 2zm6 8l.72 2.17L21 13l-2.28.83L18 16l-.72-2.17L15 13l2.28-.83L18 10zM7 14l.55 1.64L9 16.5l-1.45.86L7 19l-.55-1.64L5 16.5l1.45-.86L7 14z"/></svg>
+      <button id="ic-compact" class="chip" title="Expand wallet" aria-label="Expand wallet">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path id="p-compact" d="M5.25 2.25a.75.75 0 0 1 .673.418l.47.94.94.47a.75.75 0 0 1 0 1.344l-.94.47-.47.94a.75.75 0 0 1-1.344 0l-.47-.94-.94-.47a.75.75 0 0 1 0-1.344l.94-.47.47-.94a.75.75 0 0 1 .671-.418Zm8.25 5.25a.75.75 0 0 1 .673.418l1.195 2.39 2.39 1.195a.75.75 0 0 1 0 1.344l-2.39 1.195-1.195 2.39a.75.75 0 0 1-1.344 0l-1.195-2.39-2.39-1.195a.75.75 0 0 1 0-1.344l2.39-1.195 1.195-2.39a.75.75 0 0 1 .671-.418ZM18 2.25a.75.75 0 0 1 .673.418l.227.455.455.227a.75.75 0 0 1 0 1.344l-.455.227-.227.455a.75.75 0 0 1-1.344 0l-.227-.455-.455-.227a.75.75 0 0 1 0-1.344l.455-.227.227-.455A.75.75 0 0 1 18 2.25Z"/>
+        </svg>
       </button>
     </div>
-  </div>
-
-  <div class="tabs">
-    <button class="tab active" data-tab="overview">Overview</button>
-    <button class="tab" data-tab="history">History</button>
-    <button class="tab" data-tab="address">Address Book</button>
-    <button class="tab" data-tab="settings">Settings</button>
   </div>
 
   <!-- Compact Widget (shown in compact mode) -->
   <div class="compact-widget">
     <div class="compact-widget-inner">
       <div class="widget-label">TOTAL I/O AVAILABLE</div>
-      <div class="widget-balance" id="widget-balance">—</div>
+      <div class="widget-balance" id="widget-balance">â€”</div>
       <div id="widget-pending" class="widget-pending hidden">+<span id="widget-pending-amt">0</span> pending</div>
       <div class="widget-staking">STAKING: <span class="value" id="widget-staking">0</span></div>
-      <button class="widget-send" id="widget-send-btn"><span>▶</span> Send</button>
+      <button class="widget-send" id="widget-send-btn"><span aria-hidden="true">&#9654;</span> Send</button>
     </div>
   </div>
 
@@ -68,10 +73,10 @@
     <div class="panel">
       <div class="panel-inner">
         <div class="h3">TOTAL I/O AVAILABLE</div>
-        <div id="bignum"><span id="big-balance">—</span></div>
+        <div id="bignum"><span id="big-balance">â€”</span></div>
         <div id="pending-line" class="pending-line hidden">+<span id="pending-amt">0</span> pending</div>
         <div class="stake-line">STAKING: <span id="staking">0</span></div>
-        <button id="sendBtn" class="cta"><span>▶</span> Send</button>
+        <button id="sendBtn" class="cta"><span aria-hidden="true">&#9654;</span> Send</button>
       </div>
     </div>
     <div class="sync-wrap">
@@ -85,7 +90,7 @@
       <div class="panel-inner">
         <div class="h3">History</div>
         <table class="tx">
-          <thead><tr><th>When</th><th>Amount</th><th>Address / Txid</th></tr></thead>
+          <thead><tr><th>When</th><th>Amount</th><th>Address</th><th>Transaction</th></tr></thead>
           <tbody id="txrows"></tbody>
         </table>
       </div>
@@ -96,7 +101,7 @@
     <div class="panel">
       <div class="panel-inner">
         <div class="address-toolbar">
-          <div class="h3">Address Book</div>
+          <div class="h3">My Addresses</div>
           <button id="newAddrBtn" class="btn btn-ok sm">+ New Address</button>
         </div>
         <div id="addrGrid" class="addr-grid"></div>
@@ -104,41 +109,68 @@
     </div>
   </div>
 
+  <div id="tab-recipients" class="page hidden">
+    <div class="panel">
+      <div class="panel-inner">
+        <div id="savedRecipientsSection" class="saved-recipients-section saved-recipients-page">
+          <div class="saved-recipient-create-wrap">
+            <button id="savedRecipientCreateBtn" class="btn btn-ok" type="button">Create new recipient</button>
+          </div>
+          <div id="savedRecipientForm" class="saved-recipient-form hidden">
+            <input id="savedRecipientAliasInput" type="text" placeholder="Recipient alias">
+            <input id="savedRecipientAddressInput" type="text" placeholder="Recipient address">
+            <div class="saved-recipient-form-actions">
+              <button id="savedRecipientSaveBtn" class="btn btn-ok sm" type="button">Save recipient</button>
+              <button id="savedRecipientCancelBtn" class="btn sm hidden" type="button">Close</button>
+            </div>
+            <div id="savedRecipientErr" class="err"></div>
+          </div>
+          <div id="savedRecipientsGrid" class="addr-grid saved-recipients-grid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="tab-settings" class="page hidden">
     <div class="settings-wrap">
-      <!-- Wallet Tools Card -->
       <div class="panel wallet-tools">
         <div class="panel-inner">
           <div class="h3">Wallet Tools</div>
           <div class="tool-row">
-            <button id="btnDump" class="btn">DUMP</button>
-            <button id="btnImport" class="btn">IMPORT</button>
-            <button id="btnOpenPath" class="btn">OPEN DEFAULT PATH</button>
+            <button id="btnDump" class="btn">Dump Wallet</button>
+            <button id="btnImport" class="btn">Import Wallet</button>
+            <button id="btnOpenPath" class="btn">Open Folder</button>
+            <button id="backupWalletBtn" class="btn">Create Backup</button>
           </div>
         </div>
       </div>
 
-      <!-- Live Debug Log Card -->
+      <div class="settings-separator chain-separator-top" aria-hidden="true"></div>
+
+      <div class="panel chain-explorer">
+        <div class="panel-inner">
+          <div class="h3">Chain Explorer</div>
+          <div class="diag-actions">
+            <button id="btnExplorer" class="btn">Open Explorer</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-separator chain-separator-bottom" aria-hidden="true"></div>
+
       <div class="panel debug-log">
         <div class="panel-inner">
-          <div class="h3">Live Debug Log</div>
-          <div class="live-tail" id="live-tail"></div>
+          <div class="h3">Live Debug</div>
           <div class="diag-actions">
-            <button id="start-tail" class="btn">Start Live Tail</button>
-            <button id="stop-tail" class="btn">Stop</button>
+            <button id="start-tail" class="btn">Show Live Debug</button>
           </div>
+          <div class="live-tail hidden" id="live-tail"></div>
         </div>
       </div>
 
-      <!-- Version Info Card -->
-      <div class="panel version-info">
-        <div class="panel-inner">
-          <div class="h3">About</div>
-          <div class="version-row">
-            <span class="version-label">Wallet Version:</span>
-            <span class="version-value" id="walletVersion">—</span>
-          </div>
-        </div>
+      <div class="settings-footer">
+        <span class="version-label">Wallet Version</span>
+        <span class="version-value" id="walletVersion">â€”</span>
       </div>
     </div>
   </div>
@@ -149,8 +181,8 @@
       <input id="pass" type="password" placeholder="Wallet passphrase">
       <div class="err" id="unlockErr"></div>
       <div class="row">
-        <button id="cancelUnlock" class="btn">Cancel</button>
         <button id="doUnlock" class="btn btn-ok">Unlock</button>
+        <button id="cancelUnlock" class="btn">Cancel</button>
       </div>
     </div>
   </div>
@@ -171,12 +203,36 @@
   <div id="sendModal" class="modal hidden">
     <div class="sheet">
       <div class="title2">Send I/O</div>
-      <input id="sendAddr" type="text" placeholder="Address">
-      <input id="sendAmt" type="number" step="0.001" min="0" placeholder="Amount">
+      <div class="send-address-row">
+        <input id="sendAddr" type="text" placeholder="Recipient Address">
+        <button id="sendRecipientPickerBtn" class="send-recipient-picker" type="button" title="Recipients" aria-label="Recipients">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 3h-1V2h-2v1H8V2H6v1H5a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 17H5V9h14v11zm0-13H5V5h14v2zM7 11h5v2H7zm0 4h8v2H7z"/></svg>
+        </button>
+      </div>
+      <div id="sendRecipientMenu" class="send-recipient-menu hidden">
+        <div class="send-recipient-menu-title">Recipients</div>
+        <div id="sendRecipientMenuList" class="send-recipient-menu-list"></div>
+      </div>
+      <input id="sendAmt" type="number" step="0.1" min="0" placeholder="Amount to send">
+      <div class="send-fee-mode" id="sendFeeMode">
+        <label class="send-fee-option">
+          <input type="radio" name="sendFeeMode" value="top" checked>
+          <span>Fee on top</span>
+        </label>
+        <label class="send-fee-option">
+          <input type="radio" name="sendFeeMode" value="included">
+          <span>Fee included in amount</span>
+        </label>
+      </div>
+      <div id="sendSummary" class="send-summary hidden">
+        <div class="send-summary-row"><span>Recipient receives</span><strong id="sendSummaryRecipient">-</strong></div>
+        <div class="send-summary-row"><span>Network fee</span><strong id="sendSummaryFee">-</strong></div>
+        <div class="send-summary-row"><span>Total debited</span><strong id="sendSummaryTotal">-</strong></div>
+      </div>
       <div class="err" id="sendErr"></div>
       <div class="row">
-        <button id="cancelSend" class="btn">Cancel</button>
         <button id="doSend" class="btn btn-ok">Send</button>
+        <button id="cancelSend" class="btn">Cancel</button>
       </div>
     </div>
   </div>
@@ -184,13 +240,43 @@
   <!-- New Address modal -->
   <div id="newAddrModal" class="modal hidden">
     <div class="sheet">
-      <div class="title2">Create New Receiving Address</div>
-      <input id="newLabel" type="text" placeholder="Label (optional)">
+      <div class="title2">Generate new address</div>
+      <input id="newLabel" type="text" placeholder="Address Name">
       <div class="err" id="newAddrErr"></div>
       <div id="newAddrResult" class="newaddr-result hidden"></div>
       <div class="row">
         <button id="cancelNewAddr" class="btn">Cancel</button>
         <button id="createNewAddr" class="btn btn-ok">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="helpCenterModal" class="modal hidden">
+    <div class="sheet help-center-sheet" role="dialog" aria-modal="true" aria-labelledby="helpCenterTitle">
+      <div class="help-center-head">
+        <div id="helpCenterTitle" class="title2">Wallet Help Center</div>
+      </div>
+      <div class="help-center-layout">
+        <nav id="helpCenterNav" class="help-center-nav" aria-label="Help topics">
+          <button class="help-topic-btn active" type="button" data-topic="getting-started">Getting Started</button>
+          <button class="help-topic-btn" type="button" data-topic="overview-sync">Overview & Sync</button>
+          <button class="help-topic-btn" type="button" data-topic="sending">Sending I/O</button>
+          <button class="help-topic-btn" type="button" data-topic="addresses">My Addresses</button>
+          <button class="help-topic-btn" type="button" data-topic="recipients">Recipients</button>
+          <button class="help-topic-btn" type="button" data-topic="wallet-tools">Wallet Tools</button>
+          <button class="help-topic-btn" type="button" data-topic="security">Security</button>
+          <button class="help-topic-btn" type="button" data-topic="restore-wallet">Restore Wallet</button>
+          <button class="help-topic-btn" type="button" data-topic="peer-connections">Peer Connections</button>
+          <button class="help-topic-btn" type="button" data-topic="troubleshooting">Troubleshooting</button>
+        </nav>
+        <section class="help-center-content">
+          <div id="helpTopicTitle" class="help-topic-title"></div>
+          <p id="helpTopicIntro" class="help-topic-intro"></p>
+          <ol id="helpTopicList" class="help-topic-list"></ol>
+        </section>
+      </div>
+      <div class="help-center-actions">
+        <button id="helpCenterClose" class="btn btn-ok sm help-close-btn" type="button">Close</button>
       </div>
     </div>
   </div>
@@ -215,3 +301,4 @@
   <script src="renderer.js"></script>
 </body>
 </html>
+

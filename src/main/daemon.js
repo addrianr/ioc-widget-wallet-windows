@@ -13,6 +13,15 @@ const IS_MAC = process.platform === 'darwin';
 const DAEMON_NAME = IS_WIN ? 'iocoind.exe' : 'iocoind';
 const CLI_NAME = IS_WIN ? 'iocoin-cli.exe' : 'iocoin-cli';
 
+function pathExists(p) {
+  try {
+    fs.accessSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getDaemonInstallPath() {
   if (IS_MAC) return '/usr/local/bin/iocoind';
   if (IS_WIN) {
@@ -75,32 +84,62 @@ function findCliBinary() {
 }
 
 // ---------------------------------------------------------------------------
-// getBundledDaemonPath — where the install-source binary lives in the app
+// Bundled daemon payload/executable lookup.
+// New builds place a full runtime directory in resources/daemon.
+// Legacy builds may still place a single executable in resources root.
 // ---------------------------------------------------------------------------
-function getBundledDaemonPath() {
+function getBundledDaemonPayloadPath() {
   const resourcesPath = process.resourcesPath || path.dirname(app.getAppPath());
-  return path.join(resourcesPath, DAEMON_NAME);
+  const daemonDir = path.join(resourcesPath, 'daemon');
+  const legacyExe = path.join(resourcesPath, DAEMON_NAME);
+  return pathExists(daemonDir) ? daemonDir : legacyExe;
+}
+
+function getBundledDaemonExecutablePath() {
+  const payloadPath = getBundledDaemonPayloadPath();
+  const stats = pathExists(payloadPath) ? fs.statSync(payloadPath) : null;
+  if (!stats) return payloadPath;
+  if (stats.isDirectory()) {
+    return path.join(payloadPath, DAEMON_NAME);
+  }
+  return payloadPath;
+}
+
+function copyRecursiveSync(src, dest) {
+  const stats = fs.statSync(src);
+  if (stats.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+      copyRecursiveSync(path.join(src, entry.name), path.join(dest, entry.name));
+    }
+    return;
+  }
+
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(src, dest);
 }
 
 // ---------------------------------------------------------------------------
 // installDaemonWithAdmin — privileged install (platform-aware)
 // ---------------------------------------------------------------------------
 async function installDaemonWithAdmin() {
-  const src = getBundledDaemonPath();
-  if (!fs.existsSync(src)) {
-    throw new Error(`Bundled ${DAEMON_NAME} not found at: ${src}`);
+  const payload = getBundledDaemonPayloadPath();
+  const executable = getBundledDaemonExecutablePath();
+  if (!pathExists(executable)) {
+    throw new Error(`Bundled ${DAEMON_NAME} not found at: ${executable}`);
   }
 
   console.log('[daemon] Installing daemon with admin privileges...');
-  console.log('[daemon] Source:', src);
+  console.log('[daemon] Source payload:', payload);
+  console.log('[daemon] Source executable:', executable);
   console.log('[daemon] Target:', DAEMON_PATH);
 
   if (IS_MAC) {
-    return installDaemonMac(src);
+    return installDaemonMac(executable);
   } else if (IS_WIN) {
-    return installDaemonWin(src);
+    return installDaemonWin(payload);
   } else {
-    return installDaemonLinux(src);
+    return installDaemonLinux(executable);
   }
 }
 
@@ -136,17 +175,29 @@ function installDaemonWin(src) {
   const targetDir = path.dirname(DAEMON_PATH);
   return new Promise((resolve, reject) => {
     try {
-      // Try non-elevated first (LocalAppData doesn't need admin)
+      // Try non-elevated first (LocalAppData doesn't need admin).
+      // Copy the full daemon runtime, not just iocoind.exe, so DLL sidecars
+      // and other Windows dependencies remain beside the executable.
       if (!fs.existsSync(targetDir)) {
         fs.mkdirSync(targetDir, { recursive: true });
       }
-      fs.copyFileSync(src, DAEMON_PATH);
+      const srcStats = fs.statSync(src);
+      if (srcStats.isDirectory()) {
+        copyRecursiveSync(src, targetDir);
+      } else {
+        fs.copyFileSync(src, DAEMON_PATH);
+      }
       console.log('[daemon] Install succeeded (non-elevated)');
       resolve(true);
     } catch (e) {
       // If permission denied, try elevated via PowerShell
       console.log('[daemon] Non-elevated install failed, trying elevated...');
-      const psScript = `Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','mkdir "${targetDir}" & copy /Y "${src}" "${DAEMON_PATH}"' -Verb RunAs -Wait`;
+      const srcWin = src.replace(/'/g, "''");
+      const targetWin = targetDir.replace(/'/g, "''");
+      const payloadCmd = fs.statSync(src).isDirectory()
+        ? `Copy-Item -Path (Join-Path '${srcWin}' '*') -Destination '${targetWin}' -Recurse -Force`
+        : `Copy-Item -LiteralPath '${srcWin}' -Destination '${DAEMON_PATH.replace(/'/g, "''")}' -Force`;
+      const psScript = `Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-Command',"New-Item -ItemType Directory -Force -Path '${targetWin}' | Out-Null; ${payloadCmd}" -Verb RunAs -Wait`;
       execFile('powershell.exe', ['-Command', psScript], { timeout: 60000 }, (err) => {
         if (err) {
           reject(new Error(err.message || 'Admin install cancelled or failed'));

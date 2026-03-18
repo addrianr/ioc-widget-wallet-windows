@@ -1,29 +1,50 @@
-try {
-  if (!global.__IOC_LOCKED_WINDOW__) {
+const COMPACT_WINDOW_SIZE = { width: 480, height: 360 };
+const RUNTIME_COMPACT_WIDGET_SIZE = { width: 320, height: 300 };
+const FULL_WINDOW_SIZE = { width: 960, height: 720 };
+const SPLASH_DEBUG_WINDOW_SIZE = { width: 688, height: 584 };
+const DAEMON_STARTUP_POLL_MS = 1000;
+const INITIAL_DAEMON_RPC_TIMEOUT_MS = 45000;
+const POST_BOOTSTRAP_DAEMON_RPC_TIMEOUT_MS = 60000;
+const EARLY_CRASH_GRACE_MS = 3000;
+
+function registerStartupWindowSizeLock() {
+  try {
+    if (global.__IOC_LOCKED_WINDOW__) return;
     const { app, BrowserWindow } = require('electron');
     app.on('browser-window-created', (_evt, win) => {
       win.once('ready-to-show', () => {
         try {
-          // Lock at compact widget size on startup
           win.setResizable(false);
-          win.setMinimumSize(280, 160);
-          win.setMaximumSize(280, 160);
-          win.setSize(280, 160, true);
+          win.setMinimumSize(COMPACT_WINDOW_SIZE.width, COMPACT_WINDOW_SIZE.height);
+          win.setMaximumSize(COMPACT_WINDOW_SIZE.width, COMPACT_WINDOW_SIZE.height);
+          win.setSize(COMPACT_WINDOW_SIZE.width, COMPACT_WINDOW_SIZE.height, true);
         } catch {}
       });
     });
     global.__IOC_LOCKED_WINDOW__ = true;
-  }
-} catch {}
+  } catch {}
+}
+
+registerStartupWindowSizeLock();
 
 try { require('./ipc-ui'); } catch {}
 try { require('./rpc-compat').init(); } catch {}
-const {app, BrowserWindow, ipcMain} = require('electron');
+const {app, BrowserWindow, ipcMain, screen, powerMonitor, Menu} = require('electron');
 const path = require('path');
 const fs = require('fs');
 const {execFile} = require('child_process');
 
 let win;
+
+function clampWindowTopToVisibleArea(targetWin) {
+  if (!targetWin || targetWin.isDestroyed()) return false;
+  const bounds = targetWin.getBounds();
+  const display = screen.getDisplayMatching(bounds);
+  const workArea = display?.workArea || { x: 0, y: 0 };
+  if (bounds.y >= workArea.y) return false;
+  targetWin.setBounds({ ...bounds, y: workArea.y }, true);
+  return true;
+}
 
 function findCli() {
   const { findCliBinary } = require('./daemon');
@@ -113,6 +134,13 @@ ipcMain.handle('ioc:isFirstRun', async () => {
 // ===== Daemon status and control IPC =====
 let daemonState = { running: false, pid: null, error: null, binaryPath: null, startedByUs: false };
 
+function daemonStartupTimeoutMessage() {
+  if (process.platform === 'win32') {
+    return 'Daemon failed to become responsive. Ensure the bundled Windows daemon runtime is complete (DLL dependencies beside iocoind.exe) and install Microsoft Visual C++ Redistributable (x64) if needed.';
+  }
+  return 'Daemon failed to become responsive before timeout.';
+}
+
 ipcMain.handle('ioc:daemonStatus', async () => {
   const status = await isDaemonRunning();
   daemonState.running = status.running;
@@ -185,26 +213,28 @@ async function initDaemon() {
   }
   daemonState.startedByUs = true;
 
-  // Step 5: Quick health check — wait up to 10s for RPC to respond.
+  // Step 5: Quick health check — wait for RPC to respond.
   // If the daemon crashes immediately (missing VC++ runtime, corrupt binary),
   // we catch it here instead of leaving the splash stuck indefinitely.
-  for (let i = 0; i < 10; i++) {
-    await new Promise(r => setTimeout(r, 1000));
+  const initAttempts = Math.ceil(INITIAL_DAEMON_RPC_TIMEOUT_MS / DAEMON_STARTUP_POLL_MS);
+  for (let i = 0; i < initAttempts; i++) {
+    await new Promise(r => setTimeout(r, DAEMON_STARTUP_POLL_MS));
     const check = await isDaemonRunning();
     if (check.running) {
       console.log('[daemon] Daemon is responsive');
       return { ok: true, started: true, path: DAEMON_PATH };
     }
     const pid = findDaemonPid();
-    if (!pid && i >= 2) {
+    if (!pid && ((i + 1) * DAEMON_STARTUP_POLL_MS) >= EARLY_CRASH_GRACE_MS) {
       console.error('[daemon] Daemon process died shortly after spawn');
       daemonState.error = 'Daemon crashed on startup — check VC++ runtime';
       return { ok: false, error: 'Daemon crashed on startup. Install Microsoft Visual C++ Redistributable (x64) from https://aka.ms/vs/17/release/vc_redist.x64.exe' };
     }
   }
-  // Still not responsive after 10s — daemon may be slow loading index, proceed anyway
-  console.log('[daemon] Daemon not yet responsive after 10s, proceeding...');
-  return { ok: true, started: true, path: DAEMON_PATH };
+  const timeoutError = daemonStartupTimeoutMessage();
+  console.error('[daemon] Daemon not responsive after startup timeout');
+  daemonState.error = timeoutError;
+  return { ok: false, error: timeoutError };
 }
 // ===== End daemon IPC =====
 
@@ -226,6 +256,14 @@ ipcMain.handle('ioc:needsBootstrap', async () => {
   return bootstrap.needsBootstrap();
 });
 
+ipcMain.handle('ioc:getDailyBootstrapMetadata', async () => {
+  return bootstrap.fetchDailyBootstrapMetadata();
+});
+
+ipcMain.handle('ioc:createRebootstrapBackup', async (_event, context = {}) => {
+  return bootstrap.createRebootstrapBackup(context);
+});
+
 // Track download state for progress events
 let bootstrapDownloadAbort = null;
 
@@ -243,7 +281,62 @@ ipcMain.handle('ioc:downloadBootstrap', async (event) => {
   return result;
 });
 
-ipcMain.handle('ioc:applyBootstrap', async (event) => {
+async function stopDaemonForBootstrapApply() {
+  const running = await isDaemonRunning();
+  const existingPid = findDaemonPid();
+  if (!running.running && !existingPid) return { ok: true, stopped: false };
+
+  const { stopViaCli, stopViaHttp, findCliBinary } = require('./daemon');
+  const cli = findCliBinary();
+
+  // Try graceful RPC stop first when daemon is reachable.
+  if (running.running) {
+    try {
+      if (cli.found) {
+        await stopViaCli(cli.path);
+      } else {
+        await stopViaHttp();
+      }
+    } catch (err) {
+      console.warn('[bootstrap] Graceful daemon stop failed, will try forced stop:', err?.message || err);
+    }
+  }
+
+  // Wait for RPC to go down (best-effort).
+  await waitForDaemonStop(12000, 400);
+
+  // Ensure process is fully gone; if not, escalate to forced stop.
+  let processGone = await waitForProcessExit(12000, 300);
+  if (!processGone) {
+    let pid = findDaemonPid();
+    if (pid) {
+      killDaemonByPid(pid, 'SIGTERM');
+      processGone = await waitForProcessExit(5000, 250);
+    }
+  }
+  if (!processGone) {
+    let pid = findDaemonPid();
+    if (pid) {
+      killDaemonByPid(pid, 'SIGKILL');
+      processGone = await waitForProcessExit(5000, 250);
+    }
+  }
+  if (!processGone) {
+    killDaemonByName('SIGKILL');
+    processGone = await waitForProcessExit(5000, 250);
+  }
+  if (!processGone) {
+    return { ok: false, error: 'Daemon process did not fully exit before bootstrap apply' };
+  }
+
+  // Safety buffer requested: leave enough time for OS file handles to release.
+  await new Promise(r => setTimeout(r, 10000));
+
+  clearChild();
+  return { ok: true, stopped: true };
+}
+
+ipcMain.handle('ioc:applyBootstrap', async (event, options = {}) => {
   const sendProgress = (step, message) => {
     try {
       if (event.sender && !event.sender.isDestroyed()) {
@@ -253,6 +346,17 @@ ipcMain.handle('ioc:applyBootstrap', async (event) => {
   };
 
   try {
+    const shouldStopDaemonFirst = !!options.stopDaemonFirst;
+    if (shouldStopDaemonFirst) {
+      sendProgress('stopping', 'Stopping daemon for bootstrap refresh...');
+      const stopResult = await stopDaemonForBootstrapApply();
+      if (!stopResult.ok) {
+        sendProgress('error', stopResult.error || 'Could not stop daemon before bootstrap apply');
+        return { ok: false, error: stopResult.error || 'Could not stop daemon before bootstrap apply' };
+      }
+      sendProgress('stopping', 'Daemon stopped. Waiting for file locks to release...');
+    }
+
     // 1. Extract the bootstrap
     console.log('[bootstrap] Extracting bootstrap zip...');
     sendProgress('extracting', 'Extracting blockchain data (this may take a few minutes)...');
@@ -291,15 +395,16 @@ ipcMain.handle('ioc:applyBootstrap', async (event) => {
     daemonState.binaryPath = DAEMON_PATH;
     daemonState.needsBootstrap = false;
 
-    // 5. Wait for daemon to become responsive (up to 30s)
+    // 5. Wait for daemon to become responsive after bootstrap.
     //    The daemon needs a few seconds to load the block index.
     //    If it crashes immediately (missing VC++ runtime, DLL error),
     //    we detect it here instead of leaving the splash stuck forever.
     console.log('[bootstrap] Waiting for daemon to become responsive...');
     sendProgress('starting', 'Waiting for daemon to start...');
     let alive = false;
-    for (let i = 0; i < 30; i++) {
-      await new Promise(r => setTimeout(r, 1000));
+    const bootstrapAttempts = Math.ceil(POST_BOOTSTRAP_DAEMON_RPC_TIMEOUT_MS / DAEMON_STARTUP_POLL_MS);
+    for (let i = 0; i < bootstrapAttempts; i++) {
+      await new Promise(r => setTimeout(r, DAEMON_STARTUP_POLL_MS));
       const check = await isDaemonRunning();
       if (check.running) {
         alive = true;
@@ -308,15 +413,18 @@ ipcMain.handle('ioc:applyBootstrap', async (event) => {
       }
       // Check if the process is still alive (not crashed)
       const pid = findDaemonPid();
-      if (!pid && i >= 3) {
-        // Process gone after 3+ seconds — daemon crashed
+      if (!pid && ((i + 1) * DAEMON_STARTUP_POLL_MS) >= EARLY_CRASH_GRACE_MS) {
+        // Process gone after grace period — daemon crashed
         console.error('[bootstrap] Daemon process died — binary may be broken or missing VC++ runtime');
         sendProgress('error', 'Daemon crashed on startup. Install Microsoft Visual C++ Redistributable (x64) and retry.');
         return { ok: false, error: 'Daemon crashed on startup. Install Microsoft Visual C++ Redistributable (x64) from https://aka.ms/vs/17/release/vc_redist.x64.exe' };
       }
     }
     if (!alive) {
-      console.warn('[bootstrap] Daemon not yet responsive after 30s — may still be loading index');
+      const timeoutError = daemonStartupTimeoutMessage();
+      console.error('[bootstrap] Daemon not responsive after bootstrap startup timeout');
+      sendProgress('error', timeoutError);
+      return { ok: false, error: timeoutError };
     }
 
     return { ok: true, restarted: true };
@@ -684,7 +792,7 @@ async function computeStatus() {
 
   const [chain, peers, balance, unconfBal] = await Promise.all([
     chainPromise,
-    safeDirect('getconnectioncount', [], 0),
+    safeDirect('getconnectioncount', [], null),
     safeDirect('getbalance', [], null),
     safeDirect('getunconfirmedbalance', [], 0)
   ]);
@@ -834,8 +942,9 @@ ipcMain.handle('ioc/newaddr', async (_e, label) => {
 function createWindow() {
   // Start in compact widget size - will expand when user clicks stars icon
   win = new BrowserWindow({
-    width: 280,
-    height: 160,
+    width: COMPACT_WINDOW_SIZE.width,
+    height: COMPACT_WINDOW_SIZE.height,
+    title: 'I/O Coin Widget Wallet',
     backgroundColor: '#050A12',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: {x: 14, y: 14},
@@ -872,7 +981,76 @@ function createWindow() {
     // response === 2: Cancel - do nothing, app continues
   });
 
+  // Keep title/menu bar reachable without sticky behavior while dragging.
+  // Clamp during drag intent (will-move) and on move as fallback.
+  win.on('will-move', (event, newBounds) => {
+    const display = screen.getDisplayMatching(newBounds);
+    const workArea = display?.workArea || { x: 0, y: 0 };
+    if (newBounds.y < workArea.y) {
+      event.preventDefault();
+      win.setPosition(newBounds.x, workArea.y, true);
+    }
+  });
+  win.on('move', () => {
+    clampWindowTopToVisibleArea(win);
+  });
+
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+
+  // Ensure consistent startup proportions across displays / DPI by
+  // resetting any persisted Chromium zoom level on each launch.
+  win.webContents.on('did-finish-load', () => {
+    try {
+      win.webContents.setZoomLevel(0);
+      win.webContents.setZoomFactor(1);
+    } catch {}
+  });
+}
+
+function applyMainMenu() {
+  if (process.platform !== 'win32') return;
+  const openHelpCenterFromMenu = () => {
+    const targetWin =
+      BrowserWindow.getFocusedWindow() ||
+      BrowserWindow.getAllWindows().find(w => w && !w.isDestroyed());
+    if (!targetWin || targetWin.isDestroyed()) return;
+    try {
+      targetWin.webContents.send('ioc:open-help-center');
+    } catch {}
+  };
+  const template = [
+    {
+      label: 'File',
+      submenu: [
+        { role: process.platform === 'darwin' ? 'close' : 'quit' }
+      ]
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'delete' }
+      ]
+    },
+    {
+      label: 'Help',
+      submenu: [
+        {
+          label: 'Wallet Help Center',
+          accelerator: 'F1',
+          click: () => {
+            openHelpCenterFromMenu();
+          }
+        }
+      ]
+    }
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 app.whenReady().then(async () => {
@@ -896,7 +1074,23 @@ app.whenReady().then(async () => {
 
   // Show window IMMEDIATELY so user sees the app launched
   // Splash screen will display while daemon initializes
+  applyMainMenu();
   createWindow();
+
+  // Notify renderer when OS resumes from sleep/hibernate so UI can
+  // run a short recovery flow (reconnect peers + resume sync view).
+  if (!global.__iocPowerResumeHookInstalled) {
+    powerMonitor.on('resume', () => {
+      const payload = { resumedAt: Date.now() };
+      console.log('[power] System resume detected');
+      for (const w of BrowserWindow.getAllWindows()) {
+        if (w && !w.isDestroyed()) {
+          try { w.webContents.send('ioc:system-resume', payload); } catch {}
+        }
+      }
+    });
+    global.__iocPowerResumeHookInstalled = true;
+  }
 
   // Initialize daemon in background (install+verify, check bootstrap, start if ready)
   const daemonResult = await initDaemon();
@@ -935,91 +1129,237 @@ app.on('window-all-closed', () => {
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
 // ===== Compact Widget Mode IPC =====
-(() => {
+function resizeWindowFromCenter(targetWin, size, animate = true) {
+  const bounds = targetWin.getBounds();
+  const centerX = bounds.x + Math.round(bounds.width / 2);
+  const centerY = bounds.y + Math.round(bounds.height / 2);
+  const nextX = centerX - Math.round(size.width / 2);
+  const nextY = centerY - Math.round(size.height / 2);
+  targetWin.setBounds({
+    x: nextX,
+    y: nextY,
+    width: size.width,
+    height: size.height
+  }, animate);
+  clampWindowTopToVisibleArea(targetWin);
+}
+
+function broadcastCompactModeChange(isCompact) {
+  for (const candidate of BrowserWindow.getAllWindows()) {
+    if (!candidate || candidate.isDestroyed()) continue;
+    try {
+      candidate.webContents.send('compact-mode-changed', !!isCompact);
+    } catch {}
+  }
+}
+
+function resolveSizeFromHelpContext(rawContext) {
+  const context = rawContext && typeof rawContext === 'object' ? rawContext : {};
+  if (context.splashActive) {
+    return context.splashDebugOpen ? SPLASH_DEBUG_WINDOW_SIZE : COMPACT_WINDOW_SIZE;
+  }
+  if (context.compactMode) {
+    return RUNTIME_COMPACT_WIDGET_SIZE;
+  }
+  return FULL_WINDOW_SIZE;
+}
+
+function registerCompactModeIpc() {
   if (global.__iocCompactRegistered) return;
   global.__iocCompactRegistered = true;
-  const { ipcMain, BrowserWindow } = require('electron');
-
-  const FULL_SIZE = { width: 600, height: 525 };
-  const COMPACT_SIZE = { width: 280, height: 160 };
 
   ipcMain.handle('ioc:setCompactMode', (event, isCompact) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    if (!win) return false;
+    const targetWin = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWin) return false;
 
-    const size = isCompact ? COMPACT_SIZE : FULL_SIZE;
+    const size = isCompact ? RUNTIME_COMPACT_WIDGET_SIZE : FULL_WINDOW_SIZE;
+    targetWin.setResizable(true);
+    targetWin.setMinimumSize(size.width, size.height);
+    targetWin.setMaximumSize(size.width, size.height);
+    resizeWindowFromCenter(targetWin, size);
+    targetWin.setResizable(false);
 
-    // Temporarily allow resize to change size
-    win.setResizable(true);
-    win.setMinimumSize(size.width, size.height);
-    win.setMaximumSize(size.width, size.height);
-    win.setSize(size.width, size.height, true);
-    win.setResizable(false);
-
+    broadcastCompactModeChange(isCompact);
     return true;
   });
 
-  // App version handler
-  ipcMain.handle('ioc:getVersion', () => {
-    return app.getVersion();
+  ipcMain.handle('ioc:setSplashDebugExpanded', (event, expanded) => {
+    const targetWin = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWin) return false;
+
+    const size = expanded ? SPLASH_DEBUG_WINDOW_SIZE : COMPACT_WINDOW_SIZE;
+    targetWin.setResizable(true);
+    targetWin.setMinimumSize(size.width, size.height);
+    targetWin.setMaximumSize(size.width, size.height);
+    resizeWindowFromCenter(targetWin, size, false);
+    targetWin.setResizable(false);
+    return true;
   });
-})();
 
-(()=>{if(global.__iocSysRegistered)return;global.__iocSysRegistered=true;const e=require('electron');e.ipcMain.on('sys:openFolder',()=>{e.shell.openPath(DATA_DIR)})})();
-(()=>{if(global.__iocDiagRegistered)return;global.__iocDiagRegistered=true;const e=require('electron');const cp=require('child_process');const pathMod=require('path');const procs=new Map();const debugLog=pathMod.join(DATA_DIR,'debug.log');function start(wc){if(procs.has(wc.id))return;let p;if(process.platform==='win32'){p=cp.spawn('powershell.exe',['-Command',`Get-Content -Path "${debugLog}" -Wait -Tail 0`],{stdio:['ignore','pipe','pipe']})}else{p=cp.spawn('tail',['-F','-n0',debugLog],{stdio:['ignore','pipe','pipe']})}procs.set(wc.id,p);const send=d=>{try{wc.send('diag:data',String(d))}catch{}};p.stdout.on('data',send);p.stderr.on('data',send);p.on('close',()=>{procs.delete(wc.id)});wc.once('destroyed',()=>{try{p.kill()}catch{} procs.delete(wc.id)})}function stop(wc){const p=procs.get(wc.id);if(p){try{p.kill()}catch{} procs.delete(wc.id)}}e.ipcMain.on('diag:start',ev=>start(ev.sender));e.ipcMain.on('diag:stop',ev=>stop(ev.sender))})();
+  ipcMain.handle('ioc:setHelpCenterWindow', (event, payload = {}) => {
+    const targetWin = BrowserWindow.fromWebContents(event.sender);
+    if (!targetWin) return false;
 
-// ===== IOC Wallet Backup IPC (idempotent) =====
-(() => {
-  try {
-    const { ipcMain, app, BrowserWindow, dialog } = require('electron');
-    const fs = require('fs');
-    const path = require('path');
-    if (ipcMain._iocBackupInstalled) return;
-    ipcMain._iocBackupInstalled = true;
+    const nextSize = payload.open
+      ? FULL_WINDOW_SIZE
+      : resolveSizeFromHelpContext(payload.context);
 
-    const iocDataDir = () => {
-      const home = process.env.HOME || process.env.USERPROFILE || '';
-      if (process.platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'IOCoin');
-      if (process.platform === 'win32')  return path.join(process.env.APPDATA || path.join(home, 'AppData','Roaming'), 'IOCoin');
-      return path.join(home, '.IOCoin');
-    };
-    const walletDatPath = () => {
-      const base = iocDataDir();
-      const p1 = path.join(base, 'wallet.dat');
-      const p2 = path.join(base, 'wallets', 'wallet.dat');
-      if (fs.existsSync(p1)) return p1;
-      if (fs.existsSync(p2)) return p2;
-      return p1;
-    };
+    targetWin.setResizable(true);
+    targetWin.setMinimumSize(nextSize.width, nextSize.height);
+    targetWin.setMaximumSize(nextSize.width, nextSize.height);
+    resizeWindowFromCenter(targetWin, nextSize, true);
+    targetWin.setResizable(false);
+    return true;
+  });
 
-    ipcMain.handle('ioc:wallet:getPath', async () => walletDatPath());
+  ipcMain.handle('ioc:getVersion', () => app.getVersion());
+}
 
-    ipcMain.handle('ioc:wallet:backup', async () => {
+function registerSystemFolderIpc() {
+  if (global.__iocSysRegistered) return;
+  global.__iocSysRegistered = true;
+  ipcMain.on('sys:openFolder', () => {
+    shell.openPath(DATA_DIR);
+  });
+}
+
+function registerDiagnosticTailIpc() {
+  if (global.__iocDiagRegistered) return;
+  global.__iocDiagRegistered = true;
+
+  const cp = require('child_process');
+  const procs = new Map();
+  const debugLog = path.join(DATA_DIR, 'debug.log');
+
+  function readRecent(n) {
+    try {
+      if (!fs.existsSync(debugLog)) return '';
+      const wantedLines = Math.max(1, Number(n) || 240);
+      const stat = fs.statSync(debugLog);
+      if (!stat.size || stat.size <= 0) return '';
+
+      const chunkSize = 256 * 1024;
+      const fd = fs.openSync(debugLog, 'r');
       try {
-        const src = walletDatPath();
-        if (!fs.existsSync(src)) return { ok:false, error:`wallet.dat not found at ${src}` };
-        const ts = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
-        const defPath = path.join(app.getPath('downloads'), `wallet-${ts}.dat`);
-        const win = BrowserWindow.getFocusedWindow();
-        const { canceled, filePath } = await dialog.showSaveDialog(win, {
-          title: 'Save wallet backup',
-          defaultPath: defPath,
-          buttonLabel: 'Save Backup',
-          filters: [{ name:'Wallet Dat', extensions:['dat'] }]
-        });
-        if (canceled || !filePath) return { ok:false, canceled:true };
-        fs.copyFileSync(src, filePath);
-        return { ok:true, src, savedTo:filePath };
-      } catch (e) {
-        return { ok:false, error: e?.message || String(e) };
+        let offset = Math.max(0, stat.size - chunkSize);
+        while (true) {
+          const bytesToRead = stat.size - offset;
+          const buf = Buffer.allocUnsafe(bytesToRead);
+          fs.readSync(fd, buf, 0, bytesToRead, offset);
+          const lines = buf.toString('utf8').split(/\r?\n/);
+          if (offset === 0 || lines.length >= (wantedLines + 1)) {
+            return lines.slice(Math.max(0, lines.length - wantedLines)).join('\n');
+          }
+          const nextOffset = Math.max(0, offset - chunkSize);
+          if (nextOffset === offset) {
+            return lines.slice(Math.max(0, lines.length - wantedLines)).join('\n');
+          }
+          offset = nextOffset;
+        }
+      } finally {
+        try { fs.closeSync(fd); } catch (_) {}
       }
+    } catch (error) {
+      return String(error?.message || error);
+    }
+  }
+
+  function start(sender) {
+    if (procs.has(sender.id)) return;
+
+    let child;
+    if (process.platform === 'win32') {
+      const psPath = debugLog.replace(/'/g, "''");
+      const psCmd = `$p='${psPath}'; while (-not (Test-Path -LiteralPath $p)) { Start-Sleep -Milliseconds 500 }; Get-Content -LiteralPath $p -Wait -Tail 240`;
+      child = cp.spawn('powershell.exe', ['-Command', psCmd], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } else {
+      child = cp.spawn('sh', ['-lc', `while [ ! -f "$1" ]; do sleep 0.5; done; tail -F -n240 "$1"`, 'sh', debugLog], { stdio: ['ignore', 'pipe', 'pipe'] });
+    }
+
+    procs.set(sender.id, child);
+    const forward = (chunk) => {
+      try { sender.send('diag:data', String(chunk)); } catch {}
+    };
+
+    child.stdout.on('data', forward);
+    child.stderr.on('data', forward);
+    child.on('close', () => {
+      procs.delete(sender.id);
     });
-  } catch (_) {}
-})();
+    sender.once('destroyed', () => {
+      try { child.kill(); } catch {}
+      procs.delete(sender.id);
+    });
+  }
+
+  function stop(sender) {
+    const child = procs.get(sender.id);
+    if (!child) return;
+    try { child.kill(); } catch {}
+    procs.delete(sender.id);
+  }
+
+  ipcMain.handle('diag:recent', (_event, n) => readRecent(n));
+  ipcMain.on('diag:start', (event) => start(event.sender));
+  ipcMain.on('diag:stop', (event) => stop(event.sender));
+}
+
+function resolveWalletDataDir() {
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  if (process.platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'IOCoin');
+  if (process.platform === 'win32') return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'IOCoin');
+  return path.join(home, '.IOCoin');
+}
+
+function resolveWalletDatPath() {
+  const base = resolveWalletDataDir();
+  const primary = path.join(base, 'wallet.dat');
+  const nested = path.join(base, 'wallets', 'wallet.dat');
+  if (fs.existsSync(primary)) return primary;
+  if (fs.existsSync(nested)) return nested;
+  return primary;
+}
+
+function registerWalletBackupIpc() {
+  if (global.__iocBackupRegistered) return;
+  global.__iocBackupRegistered = true;
+
+  ipcMain.handle('ioc:wallet:getPath', async () => resolveWalletDatPath());
+
+  ipcMain.handle('ioc:wallet:backup', async () => {
+    try {
+      const sourcePath = resolveWalletDatPath();
+      if (!fs.existsSync(sourcePath)) {
+        return { ok: false, error: `wallet.dat not found at ${sourcePath}` };
+      }
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const defaultPath = path.join(app.getPath('downloads'), `wallet-${timestamp}.dat`);
+      const focusedWin = BrowserWindow.getFocusedWindow();
+
+      const { canceled, filePath } = await dialog.showSaveDialog(focusedWin, {
+        title: 'Save wallet backup',
+        defaultPath,
+        buttonLabel: 'Save Backup',
+        filters: [{ name: 'Wallet Dat', extensions: ['dat'] }]
+      });
+      if (canceled || !filePath) return { ok: false, canceled: true };
+
+      fs.copyFileSync(sourcePath, filePath);
+      return { ok: true, src: sourcePath, savedTo: filePath };
+    } catch (error) {
+      return { ok: false, error: error?.message || String(error) };
+    }
+  });
+}
+
+registerCompactModeIpc();
+registerSystemFolderIpc();
+registerDiagnosticTailIpc();
+registerWalletBackupIpc();
 // ===== end IPC =====
 
 // ===== IOC_CONTEXT_EDIT_MENU_V2 =====
-const { Menu } = require('electron');
 app.on('browser-window-created', (_e, win) => {
   win.webContents.on('context-menu', (_evt, params) => {
     const tpl = [

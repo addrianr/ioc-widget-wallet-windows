@@ -1,50 +1,71 @@
-const {contextBridge, ipcRenderer} = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
+
+function replaceListener(channel, handler) {
+  ipcRenderer.removeAllListeners(channel);
+  ipcRenderer.on(channel, handler);
+}
+
 contextBridge.exposeInMainWorld('ioc', {
-  rpc: (method, params=[]) => ipcRenderer.invoke('ioc:rpc', {method, params}),
-  tryRpc: (method, params=[]) => ipcRenderer.invoke('ioc:tryRpc', {method, params}),
+  rpc: (method, params = []) => ipcRenderer.invoke('ioc:rpc', { method, params }),
+  tryRpc: (method, params = []) => ipcRenderer.invoke('ioc:tryRpc', { method, params }),
   status: () => ipcRenderer.invoke('ioc/status'),
   logHeight: () => ipcRenderer.invoke('ioc/logheight'),
   listAddrs: () => ipcRenderer.invoke('ioc/listaddrs'),
-  listTx: (n=50) => ipcRenderer.invoke('ioc/listtx', n),
-  newAddr: (label='') => ipcRenderer.invoke('ioc/newaddr', label),
+  listTx: (n = 50) => ipcRenderer.invoke('ioc/listtx', n),
+  newAddr: (label = '') => ipcRenderer.invoke('ioc/newaddr', label),
   setLabel: (address, label) => ipcRenderer.invoke('ioc/setlabel', address, label),
-  // First-run and data directory helpers
+
   getDataDir: () => ipcRenderer.invoke('ioc:getDataDir'),
   isFirstRun: () => ipcRenderer.invoke('ioc:isFirstRun'),
-  // Daemon status
   daemonStatus: () => ipcRenderer.invoke('ioc:daemonStatus'),
-  // Open external URL
+
   openExternal: (url) => ipcRenderer.invoke('ioc:openExternal', url),
-  // Bootstrap functions
+
   needsBootstrap: () => ipcRenderer.invoke('ioc:needsBootstrap'),
+  getDailyBootstrapMetadata: () => ipcRenderer.invoke('ioc:getDailyBootstrapMetadata'),
+  createRebootstrapBackup: (context = {}) => ipcRenderer.invoke('ioc:createRebootstrapBackup', context),
   downloadBootstrap: () => ipcRenderer.invoke('ioc:downloadBootstrap'),
-  applyBootstrap: () => ipcRenderer.invoke('ioc:applyBootstrap'),
+  applyBootstrap: (options = {}) => ipcRenderer.invoke('ioc:applyBootstrap', options),
   bootstrapCleanup: () => ipcRenderer.invoke('ioc:bootstrapCleanup'),
-  // Bootstrap progress listener
-  onBootstrapProgress: (cb) => {
-    ipcRenderer.removeAllListeners('bootstrap:progress');
-    ipcRenderer.on('bootstrap:progress', (_ev, progress) => cb(progress));
-  },
-  // Window control
+
+  walletBackup: () => ipcRenderer.invoke('ioc:wallet:backup'),
+  walletPath: () => ipcRenderer.invoke('ioc:wallet:getPath'),
+
   quitApp: (stopDaemon = true) => ipcRenderer.invoke('ioc:quitApp', stopDaemon),
   hideWindow: () => ipcRenderer.invoke('ioc:hideWindow'),
   restartDaemon: () => ipcRenderer.invoke('ioc:restartDaemon'),
-  // Compact widget mode
+
   setCompactMode: (isCompact) => ipcRenderer.invoke('ioc:setCompactMode', isCompact),
-  onCompactModeChanged: (cb) => {
-    ipcRenderer.removeAllListeners('compact-mode-changed');
-    ipcRenderer.on('compact-mode-changed', (_ev, isCompact) => cb(isCompact));
+  setSplashDebugExpanded: (expanded) => ipcRenderer.invoke('ioc:setSplashDebugExpanded', expanded),
+  setHelpCenterWindow: (open, context = {}) => ipcRenderer.invoke('ioc:setHelpCenterWindow', { open, context }),
+
+  getVersion: () => ipcRenderer.invoke('ioc:getVersion'),
+
+  onBootstrapProgress: (cb) => {
+    replaceListener('bootstrap:progress', (_event, progress) => cb(progress));
   },
-  // App version
-  getVersion: () => ipcRenderer.invoke('ioc:getVersion')
-});
-(()=>{const e=require('electron');if(!globalThis.__iocSysExposed){e.contextBridge.exposeInMainWorld('sys',{openFolder:()=>e.ipcRenderer.send('sys:openFolder')});globalThis.__iocSysExposed=true}})();
-(()=>{const e=require('electron');if(!globalThis.__iocDiagExposed){e.contextBridge.exposeInMainWorld('diag',{startTail:()=>e.ipcRenderer.send('diag:start'),stopTail:()=>e.ipcRenderer.send('diag:stop'),onData:(cb)=>{e.ipcRenderer.removeAllListeners('diag:data');e.ipcRenderer.on('diag:data',(_,line)=>cb(line))}});globalThis.__iocDiagExposed=true}})();
-(()=>{try{
-  const { contextBridge, ipcRenderer } = require('electron');
-  if (!globalThis.__iocAnyInvoke) {
-    contextBridge.exposeInMainWorld('api', { invoke: (ch, ...args) => ipcRenderer.invoke(ch, ...args) });
-    contextBridge.exposeInMainWorld('electron', { ipcRenderer: { invoke: (...a) => ipcRenderer.invoke(...a) } });
-    globalThis.__iocAnyInvoke = true;
+  onSystemResume: (cb) => {
+    replaceListener('ioc:system-resume', (_event, payload) => cb(payload));
+  },
+  onCompactModeChanged: (cb) => {
+    replaceListener('compact-mode-changed', (_event, isCompact) => cb(isCompact));
+  },
+  onOpenHelpCenter: (cb) => {
+    replaceListener('ioc:open-help-center', () => cb());
   }
-}catch(_){}})();
+});
+
+contextBridge.exposeInMainWorld('sys', {
+  openFolder: () => ipcRenderer.send('sys:openFolder')
+});
+
+contextBridge.exposeInMainWorld('diag', {
+  startTail: () => ipcRenderer.send('diag:start'),
+  stopTail: () => ipcRenderer.send('diag:stop'),
+  recentTail: (n = 80) => ipcRenderer.invoke('diag:recent', n),
+  onData: (cb) => {
+    const handler = (_event, line) => cb(line);
+    ipcRenderer.on('diag:data', handler);
+    return () => ipcRenderer.removeListener('diag:data', handler);
+  }
+});

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>IOCoin Ring Preview</title>
+  <style>
+    :root {
+      --bg: #050A12;
+      --ring: rgba(103, 193, 239, 0.24);
+      --ring-glow: rgba(72, 184, 236, 0.34);
+      --accent: rgba(150, 236, 255, 1);
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      background: radial-gradient(1200px 800px at 50% 50%, #091a2b 0%, var(--bg) 55%);
+      color: #dce8f5;
+      font: 500 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    .stage {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      place-items: center;
+    }
+
+    .logo-wrap {
+      position: relative;
+      width: 196px;
+      height: 196px;
+      display: grid;
+      place-items: center;
+    }
+
+    .logo {
+      width: 150px;
+      height: 150px;
+      position: relative;
+      z-index: 2;
+      object-fit: contain;
+      opacity: 0.98;
+    }
+
+    .ring {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 1px solid rgba(146, 226, 255, 0.6);
+      box-shadow:
+        0 0 20px var(--ring-glow),
+        0 0 42px rgba(75, 195, 245, 0.28),
+        inset 0 0 0 1px rgba(255,255,255,0.08);
+    }
+
+    .ring::before {
+      content: "";
+      position: absolute;
+      inset: -1px;
+      border-radius: 50%;
+      background: conic-gradient(
+        from 0deg,
+        rgba(102,194,241,0) 0deg 300deg,
+        var(--accent) 340deg,
+        rgba(102,194,241,0) 360deg
+      );
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
+      mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
+      filter: drop-shadow(0 0 8px rgba(126, 231, 255, 0.8));
+      animation: spin 4.2s linear infinite;
+    }
+
+    .ring::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: radial-gradient(circle at 50% 2px, rgba(167,239,255,1) 0 2.4px, rgba(132,226,255,0) 5px);
+      filter: drop-shadow(0 0 9px rgba(131, 230, 255, 0.95));
+      animation: spin 4.2s linear infinite;
+    }
+
+    .hint {
+      position: fixed;
+      left: 50%;
+      bottom: 20px;
+      transform: translateX(-50%);
+      font-size: 13px;
+      opacity: 0.72;
+      letter-spacing: 0.02em;
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <div class="logo-wrap">
+      <span class="ring" aria-hidden="true"></span>
+      <img class="logo" src="../assets/icon.png" alt="IOCoin logo">
+    </div>
+  </main>
+  <div class="hint">Isolated preview of IOCoin logo + neon ring</div>
+</body>
+</html>

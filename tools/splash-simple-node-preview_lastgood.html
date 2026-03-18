@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IOCoin Simple Sync Preview</title>
+  <style>
+    :root {
+      --bg: #050A12;
+      --bg-2: #020711;
+      --accent: #33A2DA;
+      --accent-soft: #8ad9ff;
+      --accent-deep: #1a6fb7;
+      --ink: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.72);
+      --line: rgba(51,162,218,0.22);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(circle at 50% 44%, rgba(51,162,218,0.12), transparent 24%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+      font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color: var(--ink);
+      overflow: hidden;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    .preview {
+      width: min(1180px, calc(100vw - 48px));
+      min-height: 760px;
+      border-radius: 26px;
+      border: 1px solid rgba(255,255,255,0.06);
+      box-shadow: 0 34px 100px rgba(0,0,0,0.48);
+      background:
+        radial-gradient(circle at 50% 42%, rgba(51,162,218,0.08), transparent 25%),
+        linear-gradient(180deg, rgba(3,9,18,0.98), rgba(2,7,17,1));
+      padding: 48px 36px 36px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .logo {
+      width: 124px;
+      height: 124px;
+      display: block;
+      margin: 0 auto 28px;
+      object-fit: contain;
+      filter: drop-shadow(0 0 20px rgba(51,162,218,0.12));
+    }
+
+    .title {
+      text-align: center;
+      font-size: 49px;
+      line-height: 1.08;
+      font-weight: 500;
+      letter-spacing: -0.03em;
+      margin: 0;
+    }
+
+    .stats {
+      text-align: center;
+      margin-top: 30px;
+      font-size: 31px;
+      line-height: 1.2;
+      font-weight: 600;
+      color: var(--ink);
+      letter-spacing: -0.02em;
+    }
+
+    .eta {
+      text-align: center;
+      margin-top: 0;
+      font-size: 19px;
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: 0.01em;
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+      text-shadow: 0 1px 10px rgba(0,0,0,0.45);
+    }
+
+    .stage {
+      position: relative;
+      height: 300px;
+      margin-top: 8px;
+    }
+
+    .stage-svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+      overflow: visible;
+      transform: translateY(-24px) scale(0.88);
+      transform-origin: 50% 50%;
+    }
+
+    .stage-line {
+      stroke: rgba(51,162,218,0.34);
+      stroke-width: 2;
+      stroke-linecap: round;
+    }
+
+    .stage-node {
+      fill: url(#nodeGlow);
+      filter: url(#softGlow);
+    }
+
+    .stage-core {
+      fill: url(#coreFill);
+      stroke: rgba(51,162,218,0.72);
+      stroke-width: 2.4;
+      filter: url(#softGlow);
+    }
+
+    .stage-core-inner {
+      fill: none;
+      stroke: rgba(138,217,255,0.18);
+      stroke-width: 1.2;
+    }
+
+    .stage-packet {
+      fill: url(#packetFill);
+      filter: url(#packetGlow);
+    }
+
+    .stage-db-top {
+      fill: #8ad9ff;
+    }
+
+    .stage-db-body-1 {
+      fill: #2a90cf;
+    }
+
+    .stage-db-top-2 {
+      fill: #5bbef0;
+    }
+
+    .stage-db-body-2 {
+      fill: #247fbc;
+    }
+
+    .stage-db-top-3 {
+      fill: #4aaee3;
+    }
+
+    .stage-db-body-3 {
+      fill: #1c6faa;
+    }
+
+    .stage-db-dot {
+      fill: #d9f5ff;
+    }
+
+    .center {
+      position: absolute;
+      left: 50%;
+      top: 54%;
+      width: 232px;
+      height: 232px;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      border: 2px solid rgba(51,162,218,0.58);
+      background:
+        radial-gradient(circle, rgba(51,162,218,0.18), rgba(51,162,218,0.04) 60%, transparent 74%);
+      display: grid;
+      place-items: center;
+      box-shadow:
+        0 0 0 10px rgba(51,162,218,0.04),
+        0 0 36px rgba(51,162,218,0.18),
+        inset 0 0 34px rgba(51,162,218,0.08);
+    }
+
+    .center::before {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      border-radius: 50%;
+      border: 1px solid rgba(138,217,255,0.16);
+    }
+
+    .db-icon {
+      width: 96px;
+      height: 110px;
+      filter: drop-shadow(0 0 16px rgba(51,162,218,0.24));
+    }
+
+    .stage-core-logo {
+      transform-box: fill-box;
+      transform-origin: center;
+      filter:
+        drop-shadow(0 0 12px rgba(51,162,218,0.18))
+        drop-shadow(0 0 28px rgba(51,162,218,0.28));
+      pointer-events: none;
+    }
+
+    .ring {
+      position: absolute;
+      inset: 0;
+    }
+
+    .node {
+      position: absolute;
+      width: 38px;
+      height: 38px;
+      margin: -19px 0 0 -19px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%, rgba(164,231,255,1), rgba(51,162,218,0.78));
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,0.10),
+        0 0 18px rgba(51,162,218,0.42),
+        0 0 34px rgba(51,162,218,0.18);
+      animation: nodePulse 2.2s ease-in-out infinite;
+    }
+
+    .n1 { left: 50%; top: 12%; animation-delay: 0s; }
+    .n2 { left: 67%; top: 22%; animation-delay: 0.3s; }
+    .n3 { left: 74%; top: 44%; animation-delay: 0.6s; }
+    .n4 { left: 67%; top: 66%; animation-delay: 0.9s; }
+    .n5 { left: 50%; top: 76%; animation-delay: 1.2s; }
+    .n6 { left: 33%; top: 66%; animation-delay: 1.5s; }
+    .n7 { left: 26%; top: 44%; animation-delay: 1.8s; }
+    .n8 { left: 33%; top: 22%; animation-delay: 2.1s; }
+
+    .link {
+      position: absolute;
+      left: var(--x1);
+      top: var(--y1);
+      width: var(--len);
+      height: 2px;
+      transform: rotate(var(--angle));
+      transform-origin: 0 50%;
+      background: linear-gradient(90deg, rgba(51,162,218,0.0), rgba(51,162,218,0.32), rgba(51,162,218,0.10));
+      box-shadow: 0 0 12px rgba(51,162,218,0.08);
+    }
+
+    .stream {
+      position: absolute;
+      left: var(--x1);
+      top: var(--y1);
+      width: var(--len);
+      height: 16px;
+      transform: rotate(var(--angle));
+      transform-origin: 0 50%;
+      pointer-events: none;
+    }
+
+    .cube {
+      position: absolute;
+      top: 50%;
+      left: 0;
+      width: 16px;
+      height: 16px;
+      margin-top: -8px;
+      border-radius: 4px;
+      background: linear-gradient(180deg, var(--accent-soft), var(--accent));
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,0.08),
+        0 0 14px rgba(51,162,218,0.34);
+      animation: travelToCore 2.5s linear infinite;
+      animation-delay: var(--delay);
+    }
+
+    .merge {
+      position: absolute;
+      left: calc(var(--x2) - 11px);
+      top: calc(var(--y2) - 11px);
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(138,217,255,0.92), rgba(51,162,218,0));
+      opacity: 0;
+      animation: mergePulse 2.5s linear infinite;
+      animation-delay: var(--delay);
+      pointer-events: none;
+    }
+
+    .progress-wrap {
+      width: min(512px, 51%);
+      margin: 0 auto 0;
+      position: relative;
+    }
+
+    .progress {
+      height: 24px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.05);
+      overflow: hidden;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
+      position: relative;
+    }
+
+    .progress-bar {
+      width: 67%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, rgba(18,72,112,0.72), rgba(33,118,170,0.58));
+      box-shadow: 0 0 14px rgba(51,162,218,0.12);
+    }
+
+    .debug-cta-wrap {
+      margin-top: 18px;
+      display: flex;
+      justify-content: center;
+    }
+
+    .debug-cta {
+      appearance: none;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(10, 22, 42, 0.74);
+      color: rgba(255,255,255,0.92);
+      padding: 12px 20px;
+      border-radius: 999px;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      box-shadow: 0 10px 24px rgba(0,0,0,0.22);
+    }
+
+    .note {
+      position: absolute;
+      right: 18px;
+      bottom: 14px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.42);
+      letter-spacing: 0.03em;
+    }
+
+    @keyframes nodePulse {
+      0%, 100% { transform: scale(1); opacity: 0.84; }
+      50% { transform: scale(1.1); opacity: 1; }
+    }
+
+    @keyframes travelToCore {
+      0% {
+        transform: translateX(0) scale(0.84);
+        opacity: 0;
+      }
+      10% {
+        opacity: 1;
+      }
+      84% {
+        transform: translateX(calc(var(--len) - 16px)) scale(1);
+        opacity: 1;
+      }
+      100% {
+        transform: translateX(var(--len)) scale(0.52);
+        opacity: 0;
+      }
+    }
+
+    @keyframes mergePulse {
+      0%, 76% {
+        opacity: 0;
+        transform: scale(0.4);
+      }
+      86% {
+        opacity: 0.9;
+        transform: scale(1.3);
+      }
+      100% {
+        opacity: 0;
+        transform: scale(2.1);
+      }
+    }
+
+    @keyframes corePulse {
+      0%, 100% {
+        transform: scale(1);
+        opacity: 0.88;
+        filter:
+          drop-shadow(0 0 10px rgba(51,162,218,0.16))
+          drop-shadow(0 0 20px rgba(51,162,218,0.22));
+      }
+      50% {
+        transform: scale(1.04);
+        opacity: 1;
+        filter:
+          drop-shadow(0 0 14px rgba(138,217,255,0.34))
+          drop-shadow(0 0 34px rgba(51,162,218,0.42));
+      }
+    }
+
+    @media (max-width: 980px) {
+      .preview {
+        min-height: 700px;
+        padding: 34px 20px 30px;
+      }
+
+      .title {
+        font-size: 38px;
+      }
+
+      .stats {
+        font-size: 25px;
+      }
+
+      .eta {
+        font-size: 17px;
+      }
+
+      .stage {
+        height: 270px;
+      }
+
+      .stage-svg {
+        transform: translateY(-20px) scale(0.82);
+      }
+
+      .progress-wrap {
+        width: 68%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="preview">
+    <h1 class="title">Syncing with the network</h1>
+    <div class="stats">Current block: 5,540,998 - Blocks left: 2,414</div>
+
+    <div class="stage" aria-hidden="true">
+      <svg class="stage-svg" viewBox="0 0 1000 360">
+        <defs>
+          <radialGradient id="nodeGlow" cx="35%" cy="35%" r="70%">
+            <stop offset="0%" stop-color="#b6ecff"/>
+            <stop offset="100%" stop-color="#33A2DA"/>
+          </radialGradient>
+          <radialGradient id="coreFill" cx="50%" cy="50%" r="70%">
+            <stop offset="0%" stop-color="rgba(51,162,218,0.22)"/>
+            <stop offset="70%" stop-color="rgba(51,162,218,0.06)"/>
+            <stop offset="100%" stop-color="rgba(51,162,218,0.02)"/>
+          </radialGradient>
+          <linearGradient id="packetFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#8ad9ff"/>
+            <stop offset="100%" stop-color="#33A2DA"/>
+          </linearGradient>
+          <filter id="softGlow" x="-100%" y="-100%" width="300%" height="300%">
+            <feGaussianBlur stdDeviation="8" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+          <filter id="packetGlow" x="-100%" y="-100%" width="300%" height="300%">
+            <feGaussianBlur stdDeviation="4" result="blur"/>
+            <feMerge>
+              <feMergeNode in="blur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+        </defs>
+
+        <circle class="stage-core" cx="500" cy="196" r="116"></circle>
+        <circle class="stage-core-inner" cx="500" cy="196" r="90"></circle>
+
+        <line class="stage-line" x1="500" y1="58" x2="500" y2="196"></line>
+        <line class="stage-line" x1="650" y1="100" x2="500" y2="196"></line>
+        <line class="stage-line" x1="720" y1="196" x2="500" y2="196"></line>
+        <line class="stage-line" x1="650" y1="292" x2="500" y2="196"></line>
+        <line class="stage-line" x1="500" y1="334" x2="500" y2="196"></line>
+        <line class="stage-line" x1="350" y1="292" x2="500" y2="196"></line>
+        <line class="stage-line" x1="280" y1="196" x2="500" y2="196"></line>
+        <line class="stage-line" x1="350" y1="100" x2="500" y2="196"></line>
+
+        <circle class="stage-node" cx="500" cy="58" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="650" cy="100" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="0.3s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="720" cy="196" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="0.6s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="650" cy="292" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="0.9s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="500" cy="334" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="1.2s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="350" cy="292" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="1.5s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="280" cy="196" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="1.8s" repeatCount="indefinite" />
+        </circle>
+        <circle class="stage-node" cx="350" cy="100" r="19">
+          <animate attributeName="r" values="19;21;19" dur="2.2s" begin="2.1s" repeatCount="indefinite" />
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="0s" repeatCount="indefinite" path="M500 58 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="0s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="0s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="0s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="0s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="0.3s" repeatCount="indefinite" path="M650 100 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="0.3s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="0.3s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="0.3s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="0.3s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="0.6s" repeatCount="indefinite" path="M720 196 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="0.6s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="0.6s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="0.6s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="0.6s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="0.9s" repeatCount="indefinite" path="M650 292 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="0.9s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="0.9s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="0.9s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="0.9s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="1.2s" repeatCount="indefinite" path="M500 334 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="1.2s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="1.2s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="1.2s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="1.2s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="1.5s" repeatCount="indefinite" path="M350 292 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="1.5s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="1.5s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="1.5s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="1.5s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="1.8s" repeatCount="indefinite" path="M280 196 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="1.8s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="1.8s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="1.8s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="1.8s" repeatCount="indefinite"/>
+        </circle>
+
+        <g class="stage-packet">
+          <polygon points="-6,-2 0,-6 6,-2 0,2" fill="#8ad9ff"></polygon>
+          <polygon points="-6,-2 -6,4 0,8 0,2" fill="#2f9ad3"></polygon>
+          <polygon points="6,-2 6,4 0,8 0,2" fill="#1f6fb7"></polygon>
+          <animateMotion dur="2.5s" begin="2.1s" repeatCount="indefinite" path="M350 100 L500 196" />
+        </g>
+        <circle fill="rgba(138,217,255,0.9)" opacity="0">
+          <animate attributeName="opacity" values="0;0;0.9;0" dur="2.5s" begin="2.1s" repeatCount="indefinite"/>
+          <animate attributeName="r" values="3;3;14;22" dur="2.5s" begin="2.1s" repeatCount="indefinite"/>
+          <animate attributeName="cx" values="500;500;500;500" dur="2.5s" begin="2.1s" repeatCount="indefinite"/>
+          <animate attributeName="cy" values="196;196;196;196" dur="2.5s" begin="2.1s" repeatCount="indefinite"/>
+        </circle>
+
+        <image class="stage-core-logo" href="../assets/icon.png" x="444" y="140" width="112" height="112" preserveAspectRatio="xMidYMid meet">
+          <animateTransform attributeName="transform" type="scale" values="1;1.04;1" dur="1.8s" repeatCount="indefinite" additive="sum"/>
+          <animate attributeName="opacity" values="0.88;1;0.88" dur="1.8s" repeatCount="indefinite"/>
+        </image>
+      </svg>
+    </div>
+
+    <div class="progress-wrap">
+      <div class="progress">
+        <div class="progress-bar"></div>
+        <div class="eta">~20 minutes remaining</div>
+      </div>
+    </div>
+
+    <div class="debug-cta-wrap">
+      <button class="debug-cta" type="button">Show live debug</button>
+    </div>
+
+    <div class="note">HTML-only concept preview</div>
+  </div>
+</body>
+</html>
